@@ -1,0 +1,318 @@
+import cv2
+import numpy as np
+import os
+import signal
+import time
+import threading
+from flask import Flask, Response, render_template_string
+
+# Try to import RPi.GPIO, handling the case where it might be missing (dev mode)
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:
+    print("!! RPi.GPIO not found. Running in EMULATION mode (No motors).")
+    GPIO_AVAILABLE = False
+
+app = Flask(__name__)
+
+# --- HARDWARE CONFIGURATION (From integrated_bot.py) ---
+# Moved ENA off UART TX (BCM14) to BCM13; ENB already on BCM12 to avoid serial conflicts
+# If you don't need PWM speed control, set USE_PWM_EN=False to mimic Remote/new_motors.py (always-on enables).
+USE_PWM_EN = False
+Motor_ENA, Motor_IN1, Motor_IN2, Motor_IN3, Motor_IN4, Motor_ENB = 13, 17, 27, 22, 23, 12
+SERVO_PIN = 16
+
+# State Variables
+pwm_list = []
+is_moving = False
+servo_active = False
+last_clear_time = 0
+CONFIRM_DELAY = 1.0  # Time (sec) path must be clear before motors restart
+
+# --- VISION CONFIGURATION (From test.py) ---
+cap = cv2.VideoCapture(0)
+
+# Color Definitions
+COLORS = {
+    'Red': [(np.array([0, 150, 100]), np.array([4, 255, 255])),
+            (np.array([176, 150, 100]), np.array([180, 255, 255]))],
+    'Green': [(np.array([55, 150, 60]), np.array([75, 255, 255]))],
+    'Black': [(np.array([0, 0, 0]), np.array([180, 255, 30]))]
+}
+
+detection_memory = {
+    'Red':   {'box': None, 'frames': 0, 'consecutive': 0, 'saved': False},
+    'Green': {'box': None, 'frames': 0, 'consecutive': 0, 'saved': False},
+    'Black': {'box': None, 'frames': 0, 'consecutive': 0, 'saved': False}
+}
+
+# --- HARDWARE FUNCTIONS ---
+def setup_hardware():
+    if not GPIO_AVAILABLE: return
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    pins = [Motor_ENA, Motor_IN1, Motor_IN2, Motor_IN3, Motor_IN4, Motor_ENB, SERVO_PIN]
+    for pin in pins:
+        GPIO.setup(pin, GPIO.OUT)
+    
+    global pwm_list
+    pwm_list = []
+
+    if USE_PWM_EN:
+        # Initialize Motor PWMs
+        for p in [Motor_ENA, Motor_ENB]:
+            p_obj = GPIO.PWM(p, 1000)
+            p_obj.start(0)
+            pwm_list.append(p_obj)
+    else:
+        # Keep enables simply HIGH (matches Remote/new_motors.py behavior)
+        GPIO.output(Motor_ENA, GPIO.HIGH)
+        GPIO.output(Motor_ENB, GPIO.HIGH)
+
+def stop_motors():
+    global is_moving
+    is_moving = False
+    if not GPIO_AVAILABLE: return
+    for p in pwm_list: 
+        p.ChangeDutyCycle(0)
+    # Set all IN pins low (avoid list writes which can silently fail on some RPi.GPIO builds)
+    for pin in (Motor_IN1, Motor_IN2, Motor_IN3, Motor_IN4):
+        GPIO.output(pin, GPIO.LOW)
+
+# --- DISCRETE MOTOR CONTROLS (parity with Remote/new_motors.py) ---
+def _apply_speed(speed):
+    """Helper to set duty cycle for both enables or hold them high."""
+    if not GPIO_AVAILABLE: return
+    if USE_PWM_EN:
+        for p in pwm_list:
+            p.ChangeDutyCycle(speed)
+    else:
+        # With static enables, just ensure they stay HIGH
+        GPIO.output(Motor_ENA, GPIO.HIGH)
+        GPIO.output(Motor_ENB, GPIO.HIGH)
+
+def motor_forward(speed=100):
+    """Both wheels forward."""
+    global is_moving
+    is_moving = True
+    if not GPIO_AVAILABLE: return
+    _apply_speed(speed)
+    GPIO.output(Motor_IN1, GPIO.LOW)
+    GPIO.output(Motor_IN2, GPIO.HIGH)
+    GPIO.output(Motor_IN3, GPIO.LOW)
+    GPIO.output(Motor_IN4, GPIO.HIGH)
+
+def motor_backward(speed=100):
+    """Both wheels backward."""
+    global is_moving
+    is_moving = True
+    if not GPIO_AVAILABLE: return
+    _apply_speed(speed)
+    GPIO.output(Motor_IN1, GPIO.HIGH)
+    GPIO.output(Motor_IN2, GPIO.LOW)
+    GPIO.output(Motor_IN3, GPIO.HIGH)
+    GPIO.output(Motor_IN4, GPIO.LOW)
+
+def motor_right(speed=100):
+    """Pivot right: left wheel forward, right wheel backward."""
+    global is_moving
+    is_moving = True
+    if not GPIO_AVAILABLE: return
+    _apply_speed(speed)
+    GPIO.output(Motor_IN1, GPIO.LOW)
+    GPIO.output(Motor_IN2, GPIO.HIGH)
+    GPIO.output(Motor_IN3, GPIO.HIGH)
+    GPIO.output(Motor_IN4, GPIO.LOW)
+
+def motor_left(speed=100):
+    """Pivot left: left wheel backward, right wheel forward."""
+    global is_moving
+    is_moving = True
+    if not GPIO_AVAILABLE: return
+    _apply_speed(speed)
+    GPIO.output(Motor_IN1, GPIO.HIGH)
+    GPIO.output(Motor_IN2, GPIO.LOW)
+    GPIO.output(Motor_IN3, GPIO.LOW)
+    GPIO.output(Motor_IN4, GPIO.HIGH)
+
+# Backwards compatibility: keep original naming used in the vision loop
+def move_forward(speed=100):
+    global is_moving
+    is_moving = True
+    if not GPIO_AVAILABLE: return
+    motor_forward(speed)
+
+def servo_scan_routine():
+    """Runs the servo dance in a separate thread so video doesn't freeze."""
+    global servo_active
+    if not GPIO_AVAILABLE: return
+    
+    servo_active = True
+    s_pwm = GPIO.PWM(SERVO_PIN, 50)
+    s_pwm.start(0)
+    
+    # UP
+    s_pwm.ChangeDutyCycle(12.5) 
+    time.sleep(1.0) # Reduced from 5s to 1s for better responsiveness
+    
+    # DOWN
+    s_pwm.ChangeDutyCycle(2.5)
+    time.sleep(1.0)
+    
+    # CENTER/OFF
+    s_pwm.stop()
+    servo_active = False
+
+def trigger_servo_thread():
+    """Helper to start servo thread safely."""
+    if not servo_active:
+        t = threading.Thread(target=servo_scan_routine)
+        t.daemon = True
+        t.start()
+
+# --- VISION LOGIC ---
+def is_center_blocked(frame):
+    """Detects obstructions in the center 50% of the frame."""
+    try:
+        h, w = frame.shape[:2]
+        s_h, e_h, s_w, e_w = h // 4, 3 * h // 4, w // 4, 3 * w // 4
+        roi = frame[s_h:e_h, s_w:e_w]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return score < 25, (s_w, s_h, e_w, e_h)
+    except:
+        return False, (0,0,0,0)
+
+HTML = """
+<html>
+    <head><title>Robot Vision Integrated</title>
+    <style>
+        body { background: #000; color: #0f0; font-family: monospace; text-align: center; margin: 0; }
+        .container { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+        img { border: 2px solid #222; max-width: 90%; box-shadow: 0 0 20px #040; }
+        .hud { margin-bottom: 5px; font-size: 11px; letter-spacing: 1px; }
+        .status-moving { color: #0f0; font-weight: bold; }
+        .status-stopped { color: #f00; font-weight: bold; }
+    </style></head>
+    <body>
+        <div class="container">
+            <div class="hud">SYSTEM: INTEGRATED // MOTORS: <span id="m_stat">STANDBY</span></div>
+            <img src="/video_feed">
+            <br><a href="/stop_server" style="color:#600; text-decoration:none; margin-top:10px; display:block;">[ EMERGENCY SHUTDOWN ]</a>
+        </div>
+    </body>
+</html>
+"""
+
+def generate_frames():
+    global detection_memory, last_clear_time
+    
+    # Initial Start
+    move_forward(100)
+    
+    while True:
+        success, frame = cap.read()
+        if not success or frame is None:
+            continue
+        
+        try:
+            # 1. OBSTACLE DETECTION (Logic from test.py)
+            blocked, roi = is_center_blocked(frame)
+            
+            # --- MOTOR & SERVO LOGIC INTEGRATION ---
+            if blocked:
+                # Condition: Vision blocked -> Stop Motors, Start Servo
+                if is_moving:
+                    print("OBSTRUCTION DETECTED - STOPPING")
+                    stop_motors()
+                
+                # Trigger Servo (Non-blocking thread)
+                trigger_servo_thread()
+                
+                # Visuals
+                cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (0, 0, 255), 3)
+                cv2.putText(frame, "!!! BLOCKED !!!", (roi[0], roi[1]-10), 1, 1, (0, 0, 255), 2)
+                
+                # Reset clear timer
+                last_clear_time = time.time()
+                
+            else:
+                # Condition: Vision clear -> Wait for delay -> Move Motors
+                cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (80, 0, 0), 1)
+                
+                if not is_moving:
+                    # Check if enough time has passed since the last block
+                    if (time.time() - last_clear_time) > CONFIRM_DELAY:
+                        print("PATH CLEAR - RESUMING")
+                        move_forward(100)
+
+            # 2. COLOR DETECTION (Logic from test.py)
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            for color_name, ranges in COLORS.items():
+                mask = None
+                for (low, high) in ranges:
+                    m = cv2.inRange(hsv, low, high)
+                    mask = m if mask is None else cv2.bitwise_or(mask, m)
+                
+                mask = cv2.medianBlur(mask, 3) 
+                cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                found_now = False
+                for c in cnts:
+                    area = cv2.contourArea(c)
+                    min_area = 100 if color_name == 'Black' else 250
+                    
+                    if min_area < area < 50000:
+                        x, y, w, h = cv2.boundingRect(c)
+                        aspect_ratio = float(w)/h
+                        
+                        if 0.4 < aspect_ratio < 2.5:
+                            detection_memory[color_name]['box'] = (x, y, w, h)
+                            detection_memory[color_name]['frames'] = 3
+                            detection_memory[color_name]['consecutive'] += 1
+                            found_now = True
+                            break 
+                
+                if not found_now:
+                    detection_memory[color_name]['consecutive'] = 0
+                    detection_memory[color_name]['saved'] = False
+
+                mem = detection_memory[color_name]
+                if mem['frames'] > 0:
+                    bx, by, bw, bh = mem['box']
+                    b_col = (0, 255, 0) if color_name == 'Green' else (0, 0, 255)
+                    if color_name == 'Black': b_col = (255, 255, 255)
+                    
+                    is_locked = mem['consecutive'] >= 10
+                    cv2.rectangle(frame, (bx, by), (bx+bw, by+bh), b_col, 2 if is_locked else 1)
+                    cv2.putText(frame, f"{color_name} {'[LOCKED]' if is_locked else '...'}", (bx, by-5), 1, 0.7, b_col, 1)
+
+            ret, buffer = cv2.imencode('.jpg', frame)
+            yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+        except Exception as e:
+            print(f"Error in loop: {e}")
+            continue
+
+@app.route('/')
+def index(): return render_template_string(HTML)
+
+@app.route('/stop_server')
+def stop_server():
+    stop_motors()
+    cap.release()
+    if GPIO_AVAILABLE: GPIO.cleanup()
+    os.kill(os.getpid(), signal.SIGINT)
+    return "Shutdown complete."
+
+@app.route('/video_feed')
+def video_feed(): return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == "__main__":
+    setup_hardware()
+    try:
+        # Host 0.0.0.0 allows access from other devices on the network
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+    finally:
+        stop_motors()
+        if GPIO_AVAILABLE: GPIO.cleanup()
