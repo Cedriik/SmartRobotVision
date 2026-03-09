@@ -4,8 +4,8 @@ import time
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
-TRIG = 4
-ECHO = 26
+TRIG = 18
+ECHO = 19
 
 GPIO.setup(TRIG, GPIO.OUT)
 GPIO.setup(ECHO, GPIO.IN)
