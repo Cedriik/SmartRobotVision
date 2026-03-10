@@ -180,6 +180,10 @@ def stop_motors() -> None:
     if USE_PWM_EN:
         for p in pwm_list:
             p.ChangeDutyCycle(0)
+    else:
+        # Hard-disable the driver when not using PWM on EN pins.
+        GPIO.output(Motor_ENA, GPIO.LOW)
+        GPIO.output(Motor_ENB, GPIO.LOW)
     for pin in (Motor_IN1, Motor_IN2, Motor_IN3, Motor_IN4):
         GPIO.output(pin, GPIO.LOW)
 
