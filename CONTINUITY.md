@@ -20,3 +20,5 @@
 - 2026-03-10: Updated ~/Robot/Rollback/right_ultra.py pins to TRIG=18, ECHO=19. Created ~/Robot/test/us_left_test.py (TRIG=20, ECHO=21) and ~/Robot/test/us_right_test.py (TRIG=18, ECHO=19) by duplicating us_front_test.py.
 - 2026-03-10: Added and ran ~/Robot/test/gpio_diag_ultra.py. Results: RIGHT(current 18/19)=no ECHO rise, LEFT(current 20/21)=ECHO stuck high, RIGHT(legacy 4/26)=valid ~29 cm pulses; indicates right wiring still on legacy pins and left ECHO line is held high.
 - 2026-03-10: Updated left ultrasonic pins to TRIG=24, ECHO=25 in ~/Robot/Rollback/left_ultra.py and ~/Robot/test/us_left_test.py for rewiring test.
+- 2026-03-11: Pushed Pi changes (left/right ultrasonic tests, pin updates, gpio diagnostic) to GitHub Cedriik/SmartRobotVision.
+- 2026-03-11: Created ~/Robot/test/us_cam_motor.py integrating camera + front/left/right ultrasonics + motor control with 1s stop confirmation sampling and 3s turn decision sampling. Rollback snapshot: ~/Robot/Rollback/us_cam_motor.py.
