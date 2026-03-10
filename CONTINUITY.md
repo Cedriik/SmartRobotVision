@@ -27,3 +27,4 @@
 - 2026-03-11: Added a 2s camera-clearance resume gate in `test/us_cam_motor.py`: any camera blockage pulse resets the timer, and forward motion won’t start until camera has been continuously clear for `CAM_CLEAR_CONFIRM_SECONDS` and front ultrasonic is clear (`FRONT_CLEAR_CM=20.0`). Checkpoint snapshot: `test/us_cam_motor_cp3.py`.
 - 2026-03-11: Updated `stop_motors()` in `test/us_cam_motor.py` to also drive ENA/ENB LOW when not using PWM on EN pins (`USE_PWM_EN=False`), to ensure a hard motor stop. Checkpoint snapshot: `test/us_cam_motor_cp4.py`.
 - 2026-03-11: Added a simple hold gate in `test/us_cam_motor.py`: while (camera blocked) AND (front ultrasonic < `FRONT_STOP_CM`), keep motors stopped and do not start/turn; this prevents immediate movement during pulsing blockage. Checkpoint snapshot: `test/us_cam_motor_cp5.py`.
+- 2026-03-11: Added Checkpoint/us_cam_motor_frontworking.py (copied from test/us_cam_motor_cp5.py).
