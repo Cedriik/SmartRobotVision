@@ -1,4 +1,4 @@
-import os
+﻿import os
 os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_GSTREAMER", "0")
 
 import statistics
@@ -31,7 +31,11 @@ USE_PWM_EN = False
 
 # Thresholds (tune these)
 FRONT_STOP_CM = 20.0
+FRONT_CLEAR_CM = 20.0  # front must be >= this to consider "clear" for resuming forward motion
 SIDE_OBS_CM = 18.0
+
+# Camera clearance gating: require continuous "not blocked" for this long before resuming forward.
+CAM_CLEAR_CONFIRM_SECONDS = 2.0
 
 # Sampling requirements
 STOP_CONFIRM_SECONDS = 1.0
@@ -486,9 +490,11 @@ def control_loop(stop_evt: threading.Event, debug: bool, debug_errors: bool) -> 
     turning_until: float | None = None
     turning_dir: str | None = None
     front_us_blocked_since: float | None = None
+    cam_clear_since: float | None = None
+    resume_waiting = True  # don't start motors until we have verified clearance
 
     try:
-        motor_forward(100)
+        stop_motors()
 
         while not stop_evt.is_set():
             frame = shared.get_frame()
@@ -511,12 +517,20 @@ def control_loop(stop_evt: threading.Event, debug: bool, debug_errors: bool) -> 
                 if now_t >= turning_until:
                     turning_until = None
                     turning_dir = None
-                    motor_forward(100)
+                    stop_motors()
+                    resume_waiting = True
                 time.sleep(0.02)
                 continue
 
             cam_blocked, _, _ = center_block_info(frame)
             front_now = sampler.latest("front")
+
+            # Camera clearance timer. Any pulse of blockage resets the timer.
+            if cam_blocked:
+                cam_clear_since = None
+            else:
+                if cam_clear_since is None:
+                    cam_clear_since = now_t
 
             # While deciding, keep sampling and debug printing.
             if deciding_since is not None:
@@ -541,6 +555,23 @@ def control_loop(stop_evt: threading.Event, debug: bool, debug_errors: bool) -> 
                     deciding_since = None
                 time.sleep(0.02)
                 continue
+
+            # Resume gating: never start forward motion until camera has been continuously clear
+            # for 2 seconds (pulsing blockage resets the timer) and front ultrasonic is clear.
+            if resume_waiting:
+                cam_clear_ok = (
+                    cam_clear_since is not None
+                    and (now_t - cam_clear_since) >= CAM_CLEAR_CONFIRM_SECONDS
+                )
+                f_clear = sampler.median("front", STOP_CONFIRM_SECONDS)
+                front_clear_ok = f_clear is not None and f_clear >= FRONT_CLEAR_CM
+
+                if cam_clear_ok and front_clear_ok:
+                    motor_forward(100)
+                    resume_waiting = False
+                else:
+                    # Stay stopped; still allow the ultrasonic stop/turn logic below to run.
+                    stop_motors()
 
             # Stop confirmation logic:
             # - cam+front: require cam_blocked AND front US blocked for 1s, confirm by median.
