@@ -587,9 +587,15 @@ def control_loop(stop_evt: threading.Event, debug: bool, debug_errors: bool) -> 
     except Exception as e:
         print(f"control loop error: {e}")
     finally:
+        # Ensure background threads stop before shutting down pigpio.
+        stop_evt.set()
         stop_motors()
         if GPIO_AVAILABLE:
             GPIO.cleanup()
+        try:
+            t_us.join(timeout=1.0)
+        except Exception:
+            pass
         pi.stop()
 
 

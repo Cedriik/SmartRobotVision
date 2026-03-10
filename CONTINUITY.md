@@ -23,3 +23,4 @@
 - 2026-03-11: Pushed Pi changes (left/right ultrasonic tests, pin updates, gpio diagnostic) to GitHub Cedriik/SmartRobotVision.
 - 2026-03-11: Created ~/Robot/test/us_cam_motor.py integrating camera + front/left/right ultrasonics + motor control with 1s stop confirmation sampling and 3s turn decision sampling. Rollback snapshot: ~/Robot/Rollback/us_cam_motor.py.
 - 2026-03-11: Synced `~/Robot/test/us_cam_motor.py` from the Pi into this repo as `test/us_cam_motor.py`; fixed the front-US lock/stop confirmation bug (`sampler.median("front", ...)`), and created a checkpoint snapshot `test/us_cam_motor_cp1.py`.
+- 2026-03-11: Fixed a crash path where the control loop could exit and call `pi.stop()` while the ultrasonic sampler thread was still running; now `stop_evt.set()` is called and `t_us.join()` runs (best-effort) before shutting down pigpio. Checkpoint snapshot: `test/us_cam_motor_cp2.py`.
