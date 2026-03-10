@@ -16,3 +16,7 @@
 - 2026-03-09: Tuned ~/Robot/test/us_front_test.py for slower pulses (MIN_INTERVAL_S=0.14), added ECHO glitch filter (ECHO_GLITCH_US=200), and explicit invalid rejection for lock-like ~1000 cm values.
 - 2026-03-09: Hardened ~/Robot/test/us_front_test.py against recurring ~58ms bogus pulses by capping ECHO fall timeout to 25ms, adding stuck-high recovery, stronger glitch filter, and slower trigger interval.
 - 2026-03-09: Tuned ~/Robot/test/us_front_test.py with speed profiles (--speed=slow|normal|fast), min-valid thresholds, jump rejection, and EMA smoothing for moving robot use.
+- 2026-03-09: Pushed latest ultrasonic tuning updates (us_front_test.py, continuity logs) to GitHub Cedriik/SmartRobotVision.
+- 2026-03-10: Updated ~/Robot/Rollback/right_ultra.py pins to TRIG=18, ECHO=19. Created ~/Robot/test/us_left_test.py (TRIG=20, ECHO=21) and ~/Robot/test/us_right_test.py (TRIG=18, ECHO=19) by duplicating us_front_test.py.
+- 2026-03-10: Added and ran ~/Robot/test/gpio_diag_ultra.py. Results: RIGHT(current 18/19)=no ECHO rise, LEFT(current 20/21)=ECHO stuck high, RIGHT(legacy 4/26)=valid ~29 cm pulses; indicates right wiring still on legacy pins and left ECHO line is held high.
+- 2026-03-10: Updated left ultrasonic pins to TRIG=24, ECHO=25 in ~/Robot/Rollback/left_ultra.py and ~/Robot/test/us_left_test.py for rewiring test.
