@@ -2,7 +2,7 @@
 
 ## Change Log
 - 2026-03-09: Initialized tracking files (AGENT.md, CONTINUITY.md), created ~/Robot/test, and prepared rollback workflow.
-- 2026-03-17: Added `test/init_path_FrontUS.py` with front ultrasonic gating for forward motion and time-based rotations; added a top-of-file note to calibrate rotation timings.
+- 3/17/2026: Added `test/init_path_FrontUS.py` with front ultrasonic gating for forward motion and time-based rotations; added a top-of-file note to calibrate rotation timings.
 
 ## Current Working Directory
 - ~/Robot/test
