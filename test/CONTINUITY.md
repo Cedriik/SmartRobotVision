@@ -2,6 +2,7 @@
 
 ## Change Log
 - 2026-03-09: Initialized tracking files (AGENT.md, CONTINUITY.md), created ~/Robot/test, and prepared rollback workflow.
+- 2026-03-17: Added `test/init_path_FrontUS.py` with front ultrasonic gating for forward motion and time-based rotations; added a top-of-file note to calibrate rotation timings.
 
 ## Current Working Directory
 - ~/Robot/test
@@ -22,3 +23,9 @@
 - 2026-03-10: Updated left ultrasonic pins to TRIG=24, ECHO=25 in ~/Robot/Rollback/left_ultra.py and ~/Robot/test/us_left_test.py for rewiring test.
 - 2026-03-11: Pushed Pi changes (left/right ultrasonic tests, pin updates, gpio diagnostic) to GitHub Cedriik/SmartRobotVision.
 - 2026-03-11: Created ~/Robot/test/us_cam_motor.py integrating camera + front/left/right ultrasonics + motor control with 1s stop confirmation sampling and 3s turn decision sampling. Rollback snapshot: ~/Robot/Rollback/us_cam_motor.py.
+- 2026-03-11: Synced `~/Robot/test/us_cam_motor.py` from the Pi into this repo as `test/us_cam_motor.py`; fixed the front-US lock/stop confirmation bug (`sampler.median("front", ...)`), and created a checkpoint snapshot `test/us_cam_motor_cp1.py`.
+- 2026-03-11: Fixed a crash path where the control loop could exit and call `pi.stop()` while the ultrasonic sampler thread was still running; now `stop_evt.set()` is called and `t_us.join()` runs (best-effort) before shutting down pigpio. Checkpoint snapshot: `test/us_cam_motor_cp2.py`.
+- 2026-03-11: Added a 2s camera-clearance resume gate in `test/us_cam_motor.py`: any camera blockage pulse resets the timer, and forward motion won’t start until camera has been continuously clear for `CAM_CLEAR_CONFIRM_SECONDS` and front ultrasonic is clear (`FRONT_CLEAR_CM=20.0`). Checkpoint snapshot: `test/us_cam_motor_cp3.py`.
+- 2026-03-11: Updated `stop_motors()` in `test/us_cam_motor.py` to also drive ENA/ENB LOW when not using PWM on EN pins (`USE_PWM_EN=False`), to ensure a hard motor stop. Checkpoint snapshot: `test/us_cam_motor_cp4.py`.
+- 2026-03-11: Added a simple hold gate in `test/us_cam_motor.py`: while (camera blocked) AND (front ultrasonic < `FRONT_STOP_CM`), keep motors stopped and do not start/turn; this prevents immediate movement during pulsing blockage. Checkpoint snapshot: `test/us_cam_motor_cp5.py`.
+- 2026-03-11: Added Checkpoint/us_cam_motor_frontworking.py (copied from test/us_cam_motor_cp5.py).
