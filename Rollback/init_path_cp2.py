@@ -44,7 +44,7 @@ SIDE_HARD_LIMIT_CM = 2.5
 SIDE_PID_ACTIVE_MAX_CM = 20.0
 
 # Ultrasonic timing/noise controls
-MIN_INTERVAL_S = 0.03
+MIN_INTERVAL_S = 0.06
 ECHO_RISE_TIMEOUT_S = 0.03
 ECHO_FALL_TIMEOUT_S = 0.025
 ECHO_GLITCH_US = 350
@@ -62,7 +62,7 @@ PRE_TURN_VERIFY_SECONDS = 0.8
 POST_TURN_STABILIZE_SECONDS = 0.8
 
 # Side-centering PID controls
-PID_LOOP_DT_S = 0.025
+PID_LOOP_DT_S = 0.05
 PID_FILTER_ALPHA = 0.30
 PID_KP = 2.2
 PID_KI = 0.08
@@ -70,7 +70,7 @@ PID_KD = 0.10
 PID_DEADBAND_CM = 0.35
 PID_INTEGRAL_LIMIT = 9.0
 PID_MAX_LEFT_ADJUST = 10.0
-PID_MAX_RIGHT_ADJUST = 22.0
+PID_MAX_RIGHT_ADJUST = 18.0
 RIGHT_TURN_GAIN_BOOST = 1.08
 RIGHT_REFERENCE_WEIGHT = 1.35
 LEFT_REFERENCE_WEIGHT = 0.90
@@ -233,7 +233,7 @@ def average_distance(pi: pigpio.pi, sensor_name: str, sample_seconds: float, deb
         dist = get_distance_cm(pi, sensor_name, debug=debug)
         if dist is not None:
             samples.append(dist)
-        time.sleep(0.01)
+        time.sleep(0.02)
 
     if not samples:
         return None
@@ -462,11 +462,8 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
         integral = clamp(integral + (integral_input * dt), -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT)
         derivative = 0.0 if mode == "trim-only" else (error - previous_error) / dt
         kp, kd, right_boost, min_adjust = get_pid_profile(front_filtered, mode)
-        control_signal = 0.0 if mode == "trim-only" else (
-            (kp * error) + (PID_KI * integral) + (kd * derivative)
-        )
         raw_adjust = 0.0 if mode == "trim-only" else clamp(
-            control_signal,
+            (kp * error) + (PID_KI * integral) + (kd * derivative),
             -PID_MAX_LEFT_ADJUST,
             PID_MAX_RIGHT_ADJUST,
         )
@@ -491,7 +488,7 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
                 f"front={format_distance(front_filtered)} "
                 f"left={format_distance(left_filtered)} "
                 f"right={format_distance(right_filtered)} "
-                f"err={error:.2f} raw={control_signal:.1f} adj={adjust:.1f} "
+                f"err={error:.2f} adj={adjust:.1f} "
                 f"base=({base_left_duty:.0f},{base_right_duty:.0f}) "
                 f"pwm=({left_duty:.0f},{right_duty:.0f})"
             )
