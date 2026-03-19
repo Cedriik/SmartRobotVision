@@ -41,7 +41,15 @@ MAX_DISTANCE_CM = 400.0
 SIDE_SAMPLE_SECONDS = 2.0
 TURN_SECONDS = 1.0
 RESUME_PAUSE_S = 0.20
-TEST_FORWARD_SECONDS = 2.0
+PRE_TURN_VERIFY_SECONDS = 1.0
+POST_TURN_STABILIZE_SECONDS = 1.0
+
+# First-pass side alignment control while moving forward
+ALIGN_SAMPLE_SECONDS = 0.20
+ALIGN_KP = 0.60
+ALIGN_MAX_PWM_DELTA = 18.0
+ALIGN_MIN_VALID_CM = 4.0
+ALIGN_MAX_VALID_CM = 150.0
 
 SENSORS = {
     "front": {"trig": FRONT_TRIG, "echo": FRONT_ECHO, "last_trigger": 0.0},
@@ -64,6 +72,17 @@ def setup_motors(pi: pigpio.pi) -> None:
     pi.set_PWM_range(ENB, 100)
     pi.set_PWM_dutycycle(ENA, PWM_DUTY)
     pi.set_PWM_dutycycle(ENB, PWM_DUTY)
+
+
+def set_drive_pwm(pi: pigpio.pi, left_pwm: float, right_pwm: float) -> None:
+    left_pwm = max(0, min(100, int(round(left_pwm))))
+    right_pwm = max(0, min(100, int(round(right_pwm))))
+    pi.set_PWM_dutycycle(ENA, left_pwm)
+    pi.set_PWM_dutycycle(ENB, right_pwm)
+
+
+def reset_drive_pwm(pi: pigpio.pi) -> None:
+    set_drive_pwm(pi, PWM_DUTY, PWM_DUTY)
 
 
 def stop(pi: pigpio.pi) -> None:
@@ -184,6 +203,51 @@ def report_side_status(left_avg: float | None, right_avg: float | None) -> None:
     print(f"Side verification -> left: {left_text}, right: {right_text}")
 
 
+def report_single_sensor(label: str, avg: float | None) -> None:
+    text = "invalid" if avg is None else f"{avg:.1f} cm"
+    print(f"{label} -> {text}")
+
+
+def compute_alignment_pwm(left_avg: float, right_avg: float) -> tuple[float, float]:
+    error = left_avg - right_avg
+    correction = max(-ALIGN_MAX_PWM_DELTA, min(ALIGN_MAX_PWM_DELTA, ALIGN_KP * error))
+    left_pwm = PWM_DUTY - correction
+    right_pwm = PWM_DUTY + correction
+    return left_pwm, right_pwm
+
+
+def apply_forward_alignment(pi: pigpio.pi, debug: bool) -> None:
+    left_avg = average_distance(pi, "left", ALIGN_SAMPLE_SECONDS, debug=debug)
+    right_avg = average_distance(pi, "right", ALIGN_SAMPLE_SECONDS, debug=debug)
+
+    if left_avg is None or right_avg is None:
+        reset_drive_pwm(pi)
+        if debug:
+            report_side_status(left_avg, right_avg)
+            print("[debug] alignment skipped due to invalid side reading")
+        return
+
+    if not (ALIGN_MIN_VALID_CM <= left_avg <= ALIGN_MAX_VALID_CM):
+        reset_drive_pwm(pi)
+        if debug:
+            print(f"[debug] alignment skipped: left out of range ({left_avg:.1f} cm)")
+        return
+
+    if not (ALIGN_MIN_VALID_CM <= right_avg <= ALIGN_MAX_VALID_CM):
+        reset_drive_pwm(pi)
+        if debug:
+            print(f"[debug] alignment skipped: right out of range ({right_avg:.1f} cm)")
+        return
+
+    left_pwm, right_pwm = compute_alignment_pwm(left_avg, right_avg)
+    set_drive_pwm(pi, left_pwm, right_pwm)
+    if debug:
+        print(
+            f"[debug] align left={left_avg:.1f} right={right_avg:.1f} "
+            f"-> pwm L={left_pwm:.1f} R={right_pwm:.1f}"
+        )
+
+
 def choose_turn_direction(left_avg: float | None, right_avg: float | None) -> str | None:
     left_clear = left_avg is not None and left_avg >= SIDE_CLEAR_CM
     right_clear = right_avg is not None and right_avg >= SIDE_CLEAR_CM
@@ -211,6 +275,21 @@ def drive_turn(direction: str, duration_s: float, pi: pigpio.pi) -> None:
     while time.perf_counter() - start < duration_s:
         time.sleep(0.02)
     stop(pi)
+
+
+def verify_side_before_turn(direction: str, pi: pigpio.pi, debug: bool) -> None:
+    side_avg = average_distance(pi, direction, PRE_TURN_VERIFY_SECONDS, debug=debug)
+    report_single_sensor(f"Pre-turn {direction} check", side_avg)
+    if side_avg is not None and side_avg < SIDE_CLEAR_CM:
+        print(
+            f"Warning: {direction} side is below {SIDE_CLEAR_CM:.1f} cm, "
+            "but continuing because the path is predetermined."
+        )
+
+
+def stabilize_after_turn(pi: pigpio.pi, debug: bool) -> None:
+    front_avg = average_distance(pi, "front", POST_TURN_STABILIZE_SECONDS, debug=debug)
+    report_single_sensor("Post-turn front check", front_avg)
 
 
 def verify_and_turn(pi: pigpio.pi, debug: bool) -> bool:
@@ -247,19 +326,41 @@ def execute_forward_with_all_us(duration_s: float, pi: pigpio.pi, debug: bool) -
     stop(pi)
 
 
-def execute_step(direction: str, duration_s: float, pi: pigpio.pi, debug: bool) -> None:
+def execute_forward_until_blocked(pi: pigpio.pi, debug: bool) -> None:
+    reset_drive_pwm(pi)
+    forward(pi)
+
+    while True:
+        dist = get_distance_cm(pi, "front", debug=debug)
+        if dist is not None and dist < FRONT_STOP_CM:
+            stop(pi)
+            reset_drive_pwm(pi)
+            print(f"Front blocked at {dist:.1f} cm")
+            return
+        apply_forward_alignment(pi, debug)
+        time.sleep(0.02)
+
+
+def execute_step(direction: str, duration_s: float | None, pi: pigpio.pi, debug: bool) -> None:
     direction = direction.strip().lower()
-    print(f"{direction} for {duration_s:.1f}s")
 
     if direction in ("forward", "straight"):
-        execute_forward_with_all_us(duration_s, pi, debug)
+        print(f"{direction} until front ultrasonic stop")
+        execute_forward_until_blocked(pi, debug)
         return
+
+    if duration_s is None:
+        raise ValueError(f"Timed direction requires a duration: {direction}")
+
+    print(f"{direction} for {duration_s:.1f}s")
 
     if direction == "backward":
         backward(pi)
     elif direction == "left":
+        verify_side_before_turn("left", pi, debug)
         left(pi)
     elif direction == "right":
+        verify_side_before_turn("right", pi, debug)
         right(pi)
     elif direction == "stop":
         stop(pi)
@@ -270,6 +371,8 @@ def execute_step(direction: str, duration_s: float, pi: pigpio.pi, debug: bool) 
     while time.perf_counter() - start < duration_s:
         time.sleep(0.02)
     stop(pi)
+    if direction in ("left", "right"):
+        stabilize_after_turn(pi, debug)
 
 
 def main() -> None:
@@ -282,36 +385,28 @@ def main() -> None:
     setup_motors(pi)
     setup_ultrasonic(pi)
 
-    # Predetermined path disabled for now to avoid conflicts while validating
-    # the all-ultrasonic turn-decision logic.
-    #
-    # path = [
-    #     ("straight", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    # ]
-    #
-    # for name, dur in path:
-    #     execute_step(name, dur, pi, debug=debug)
-    #     time.sleep(0.2)
+    path = [
+        ("straight", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+    ]
 
-    print(
-        "init_path_AllUS.py ready. Predetermined path is commented out in main(). "
-        f"Running guarded forward test for {TEST_FORWARD_SECONDS:.1f}s."
-    )
+    print("init_path_AllUS.py ready. Predetermined path is active in main().")
 
     try:
-        execute_forward_with_all_us(TEST_FORWARD_SECONDS, pi, debug)
+        for name, dur in path:
+            execute_step(name, dur, pi, debug=debug)
+            time.sleep(0.2)
     except KeyboardInterrupt:
         print("\nStopped by user")
     finally:

@@ -41,6 +41,8 @@ MAX_DISTANCE_CM = 400.0
 SIDE_SAMPLE_SECONDS = 2.0
 TURN_SECONDS = 1.0
 RESUME_PAUSE_S = 0.20
+PRE_TURN_VERIFY_SECONDS = 1.0
+POST_TURN_STABILIZE_SECONDS = 1.0
 
 SENSORS = {
     "front": {"trig": FRONT_TRIG, "echo": FRONT_ECHO, "last_trigger": 0.0},
@@ -183,6 +185,11 @@ def report_side_status(left_avg: float | None, right_avg: float | None) -> None:
     print(f"Side verification -> left: {left_text}, right: {right_text}")
 
 
+def report_single_sensor(label: str, avg: float | None) -> None:
+    text = "invalid" if avg is None else f"{avg:.1f} cm"
+    print(f"{label} -> {text}")
+
+
 def choose_turn_direction(left_avg: float | None, right_avg: float | None) -> str | None:
     left_clear = left_avg is not None and left_avg >= SIDE_CLEAR_CM
     right_clear = right_avg is not None and right_avg >= SIDE_CLEAR_CM
@@ -210,6 +217,21 @@ def drive_turn(direction: str, duration_s: float, pi: pigpio.pi) -> None:
     while time.perf_counter() - start < duration_s:
         time.sleep(0.02)
     stop(pi)
+
+
+def verify_side_before_turn(direction: str, pi: pigpio.pi, debug: bool) -> None:
+    side_avg = average_distance(pi, direction, PRE_TURN_VERIFY_SECONDS, debug=debug)
+    report_single_sensor(f"Pre-turn {direction} check", side_avg)
+    if side_avg is not None and side_avg < SIDE_CLEAR_CM:
+        print(
+            f"Warning: {direction} side is below {SIDE_CLEAR_CM:.1f} cm, "
+            "but continuing because the path is predetermined."
+        )
+
+
+def stabilize_after_turn(pi: pigpio.pi, debug: bool) -> None:
+    front_avg = average_distance(pi, "front", POST_TURN_STABILIZE_SECONDS, debug=debug)
+    report_single_sensor("Post-turn front check", front_avg)
 
 
 def verify_and_turn(pi: pigpio.pi, debug: bool) -> bool:
@@ -246,19 +268,38 @@ def execute_forward_with_all_us(duration_s: float, pi: pigpio.pi, debug: bool) -
     stop(pi)
 
 
-def execute_step(direction: str, duration_s: float, pi: pigpio.pi, debug: bool) -> None:
+def execute_forward_until_blocked(pi: pigpio.pi, debug: bool) -> None:
+    forward(pi)
+
+    while True:
+        dist = get_distance_cm(pi, "front", debug=debug)
+        if dist is not None and dist < FRONT_STOP_CM:
+            stop(pi)
+            print(f"Front blocked at {dist:.1f} cm")
+            return
+        time.sleep(0.02)
+
+
+def execute_step(direction: str, duration_s: float | None, pi: pigpio.pi, debug: bool) -> None:
     direction = direction.strip().lower()
-    print(f"{direction} for {duration_s:.1f}s")
 
     if direction in ("forward", "straight"):
-        execute_forward_with_all_us(duration_s, pi, debug)
+        print(f"{direction} until front ultrasonic stop")
+        execute_forward_until_blocked(pi, debug)
         return
+
+    if duration_s is None:
+        raise ValueError(f"Timed direction requires a duration: {direction}")
+
+    print(f"{direction} for {duration_s:.1f}s")
 
     if direction == "backward":
         backward(pi)
     elif direction == "left":
+        verify_side_before_turn("left", pi, debug)
         left(pi)
     elif direction == "right":
+        verify_side_before_turn("right", pi, debug)
         right(pi)
     elif direction == "stop":
         stop(pi)
@@ -269,6 +310,8 @@ def execute_step(direction: str, duration_s: float, pi: pigpio.pi, debug: bool) 
     while time.perf_counter() - start < duration_s:
         time.sleep(0.02)
     stop(pi)
+    if direction in ("left", "right"):
+        stabilize_after_turn(pi, debug)
 
 
 def main() -> None:
@@ -281,34 +324,28 @@ def main() -> None:
     setup_motors(pi)
     setup_ultrasonic(pi)
 
-    # Predetermined path disabled for now to avoid conflicts while validating
-    # the all-ultrasonic turn-decision logic.
-    #
-    # path = [
-    #     ("straight", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    # ]
-    #
-    # for name, dur in path:
-    #     execute_step(name, dur, pi, debug=debug)
-    #     time.sleep(0.2)
+    path = [
+        ("straight", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+    ]
 
-    print("init_path_AllUS.py ready. Predetermined path is commented out in main().")
+    print("init_path_AllUS.py ready. Predetermined path is active in main().")
 
     try:
-        while True:
-            time.sleep(0.5)
+        for name, dur in path:
+            execute_step(name, dur, pi, debug=debug)
+            time.sleep(0.2)
     except KeyboardInterrupt:
         print("\nStopped by user")
     finally:
