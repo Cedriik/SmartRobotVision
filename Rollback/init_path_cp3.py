@@ -86,16 +86,6 @@ LONG_RANGE_KP_MULTIPLIER = 1.80
 LONG_RANGE_KD_MULTIPLIER = 1.40
 LONG_RANGE_RIGHT_BOOST = 1.35
 LONG_RANGE_MIN_ADJUST_PWM = 6.0
-FRONT_COARSE_VERIFY_CM = 14.0
-COARSE_RECOVERY_ENTER_ERROR = 8.0
-COARSE_RECOVERY_EXIT_ERROR = 3.5
-COARSE_RECOVERY_ENTER_DELTA = 4.0
-COARSE_RECOVERY_EXIT_DELTA = 2.0
-COARSE_KP_MULTIPLIER = 1.45
-COARSE_KI_MULTIPLIER = 1.60
-COARSE_KD_MULTIPLIER = 1.30
-COARSE_RIGHT_BOOST = 1.25
-COARSE_MIN_ADJUST_PWM = 8.0
 PID_DEBUG_PRINT_INTERVAL_S = 0.25
 
 # Path definition
@@ -392,14 +382,6 @@ def compute_passage_error(left_cm: float | None, right_cm: float | None) -> tupl
     return 0.0, "trim-only"
 
 
-def compute_visible_side_delta(left_cm: float | None, right_cm: float | None) -> float:
-    left_pid = pid_visible_distance(left_cm)
-    right_pid = pid_visible_distance(right_cm)
-    if left_pid is None or right_pid is None:
-        return 0.0
-    return right_pid - left_pid
-
-
 def choose_forward_base_duty(
     front_cm: float | None,
     left_cm: float | None,
@@ -423,13 +405,8 @@ def choose_forward_base_duty(
     return base_duty
 
 
-def get_pid_profile(
-    front_cm: float | None,
-    mode: str,
-    coarse_recovery: bool,
-) -> tuple[float, float, float, float, float]:
+def get_pid_profile(front_cm: float | None, mode: str) -> tuple[float, float, float, float]:
     kp = PID_KP
-    ki = PID_KI
     kd = PID_KD
     right_boost = RIGHT_TURN_GAIN_BOOST
     min_adjust = 0.0
@@ -445,14 +422,7 @@ def get_pid_profile(
         right_boost *= LONG_RANGE_RIGHT_BOOST
         min_adjust = max(min_adjust, LONG_RANGE_MIN_ADJUST_PWM)
 
-    if coarse_recovery:
-        kp *= COARSE_KP_MULTIPLIER
-        ki *= COARSE_KI_MULTIPLIER
-        kd *= COARSE_KD_MULTIPLIER
-        right_boost *= COARSE_RIGHT_BOOST
-        min_adjust = max(min_adjust, COARSE_MIN_ADJUST_PWM)
-
-    return kp, ki, kd, right_boost, min_adjust
+    return kp, kd, right_boost, min_adjust
 
 
 def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str:
@@ -462,7 +432,6 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
 
     integral = 0.0
     previous_error = 0.0
-    coarse_recovery = False
     loop_started_at = time.perf_counter()
     motion_started_at = loop_started_at
     last_debug_at = 0.0
@@ -497,20 +466,6 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
             print("Lost both side-wall readings. Robot stopped for safety.")
             return "side_lost"
 
-        side_delta = compute_visible_side_delta(left_filtered, right_filtered)
-        front_allows_coarse = front_filtered is None or front_filtered >= FRONT_COARSE_VERIFY_CM
-        if coarse_recovery:
-            if (
-                abs(error) <= COARSE_RECOVERY_EXIT_ERROR
-                and abs(side_delta) <= COARSE_RECOVERY_EXIT_DELTA
-            ) or not front_allows_coarse:
-                coarse_recovery = False
-        elif front_allows_coarse and (
-            abs(error) >= COARSE_RECOVERY_ENTER_ERROR
-            or abs(side_delta) >= COARSE_RECOVERY_ENTER_DELTA
-        ):
-            coarse_recovery = True
-
         now = time.perf_counter()
         dt = max(now - loop_started_at, 0.001)
         loop_started_at = now
@@ -523,9 +478,9 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
         integral_input = error * (POSITIVE_INTEGRAL_GAIN if error > 0.0 else 1.0)
         integral = clamp(integral + (integral_input * dt), -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT)
         derivative = 0.0 if mode == "trim-only" else (error - previous_error) / dt
-        kp, ki, kd, right_boost, min_adjust = get_pid_profile(front_filtered, mode, coarse_recovery)
+        kp, kd, right_boost, min_adjust = get_pid_profile(front_filtered, mode)
         control_signal = 0.0 if mode == "trim-only" else (
-            (kp * error) + (ki * integral) + (kd * derivative)
+            (kp * error) + (PID_KI * integral) + (kd * derivative)
         )
         raw_adjust = 0.0 if mode == "trim-only" else clamp(
             control_signal,
@@ -549,11 +504,11 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
         if debug and (now - last_debug_at) >= PID_DEBUG_PRINT_INTERVAL_S:
             print(
                 "[pid] "
-                f"mode={mode}{'+coarse' if coarse_recovery else ''} "
+                f"mode={mode} "
                 f"front={format_distance(front_filtered)} "
                 f"left={format_distance(left_filtered)} "
                 f"right={format_distance(right_filtered)} "
-                f"err={error:.2f} delta={side_delta:.2f} raw={control_signal:.1f} adj={adjust:.1f} "
+                f"err={error:.2f} raw={control_signal:.1f} adj={adjust:.1f} "
                 f"base=({base_left_duty:.0f},{base_right_duty:.0f}) "
                 f"pwm=({left_duty:.0f},{right_duty:.0f})"
             )

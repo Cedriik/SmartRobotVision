@@ -19,7 +19,7 @@ DEFAULT_PWM_DUTY = 60
 BASE_CRUISE_PWM_DUTY = 42
 BASE_TIGHT_PWM_DUTY = 30
 BASE_CRAWL_PWM_DUTY = 24
-TURN_PWM_DUTY = 80
+TURN_PWM_DUTY = 32
 MIN_DRIVE_PWM_DUTY = 20
 MAX_DRIVE_PWM_DUTY = 60
 LEFT_MOTOR_TRIM_PWM = 3.0
@@ -64,56 +64,29 @@ POST_TURN_STABILIZE_SECONDS = 0.8
 # Side-centering PID controls
 PID_LOOP_DT_S = 0.025
 PID_FILTER_ALPHA = 0.30
-PID_KP = 2.5
-PID_KI = 0.10
-PID_KD = 0.12
-PID_DEADBAND_CM = 0.25
-PID_INTEGRAL_LIMIT = 10.0
+PID_KP = 2.2
+PID_KI = 0.08
+PID_KD = 0.10
+PID_DEADBAND_CM = 0.35
+PID_INTEGRAL_LIMIT = 9.0
 PID_MAX_LEFT_ADJUST = 10.0
-PID_MAX_RIGHT_ADJUST = 24.0
-RIGHT_TURN_GAIN_BOOST = 1.12
-RIGHT_REFERENCE_WEIGHT = 1.45
+PID_MAX_RIGHT_ADJUST = 22.0
+RIGHT_TURN_GAIN_BOOST = 1.08
+RIGHT_REFERENCE_WEIGHT = 1.35
 LEFT_REFERENCE_WEIGHT = 0.90
-POSITIVE_ERROR_EXP_GAIN = 0.26
+POSITIVE_ERROR_EXP_GAIN = 0.22
 NEGATIVE_ERROR_EXP_GAIN = 0.06
 MAX_ERROR_EXP_SCALE = 3.0
-POSITIVE_INTEGRAL_GAIN = 2.6
-RIGHT_WALL_KP_MULTIPLIER = 1.25
-RIGHT_WALL_RIGHT_BOOST = 1.45
-RIGHT_WALL_MIN_ADJUST_PWM = 7.0
+POSITIVE_INTEGRAL_GAIN = 2.2
+RIGHT_WALL_KP_MULTIPLIER = 1.15
+RIGHT_WALL_RIGHT_BOOST = 1.35
+RIGHT_WALL_MIN_ADJUST_PWM = 6.0
 LONG_RANGE_FRONT_CM = 60.0
-LONG_RANGE_KP_MULTIPLIER = 1.80
+LONG_RANGE_KP_MULTIPLIER = 1.60
 LONG_RANGE_KD_MULTIPLIER = 1.40
-LONG_RANGE_RIGHT_BOOST = 1.35
-LONG_RANGE_MIN_ADJUST_PWM = 6.0
-FRONT_COARSE_VERIFY_CM = 14.0
-COARSE_RECOVERY_ENTER_ERROR = 8.0
-COARSE_RECOVERY_EXIT_ERROR = 3.5
-COARSE_RECOVERY_ENTER_DELTA = 4.0
-COARSE_RECOVERY_EXIT_DELTA = 2.0
-COARSE_KP_MULTIPLIER = 1.45
-COARSE_KI_MULTIPLIER = 1.60
-COARSE_KD_MULTIPLIER = 1.30
-COARSE_RIGHT_BOOST = 1.25
-COARSE_MIN_ADJUST_PWM = 8.0
+LONG_RANGE_RIGHT_BOOST = 1.25
+LONG_RANGE_MIN_ADJUST_PWM = 5.0
 PID_DEBUG_PRINT_INTERVAL_S = 0.25
-
-# Path definition
-PATH_STEPS = [
-    ("straight", None),
-    ("right", 1.0),
-    ("forward", None),
-    ("right", 1.0),
-    ("forward", None),
-    ("right", 1.0),
-    ("forward", None),
-    ("left", 1.0),
-    ("forward", None),
-    ("left", 1.0),
-    ("forward", None),
-    ("left", 1.0),
-    ("forward", None),
-]
 
 SENSORS = {
     "front": {"trig": FRONT_TRIG, "echo": FRONT_ECHO, "last_trigger": 0.0},
@@ -392,14 +365,6 @@ def compute_passage_error(left_cm: float | None, right_cm: float | None) -> tupl
     return 0.0, "trim-only"
 
 
-def compute_visible_side_delta(left_cm: float | None, right_cm: float | None) -> float:
-    left_pid = pid_visible_distance(left_cm)
-    right_pid = pid_visible_distance(right_cm)
-    if left_pid is None or right_pid is None:
-        return 0.0
-    return right_pid - left_pid
-
-
 def choose_forward_base_duty(
     front_cm: float | None,
     left_cm: float | None,
@@ -423,13 +388,8 @@ def choose_forward_base_duty(
     return base_duty
 
 
-def get_pid_profile(
-    front_cm: float | None,
-    mode: str,
-    coarse_recovery: bool,
-) -> tuple[float, float, float, float, float]:
+def get_pid_profile(front_cm: float | None, mode: str) -> tuple[float, float, float, float]:
     kp = PID_KP
-    ki = PID_KI
     kd = PID_KD
     right_boost = RIGHT_TURN_GAIN_BOOST
     min_adjust = 0.0
@@ -445,14 +405,7 @@ def get_pid_profile(
         right_boost *= LONG_RANGE_RIGHT_BOOST
         min_adjust = max(min_adjust, LONG_RANGE_MIN_ADJUST_PWM)
 
-    if coarse_recovery:
-        kp *= COARSE_KP_MULTIPLIER
-        ki *= COARSE_KI_MULTIPLIER
-        kd *= COARSE_KD_MULTIPLIER
-        right_boost *= COARSE_RIGHT_BOOST
-        min_adjust = max(min_adjust, COARSE_MIN_ADJUST_PWM)
-
-    return kp, ki, kd, right_boost, min_adjust
+    return kp, kd, right_boost, min_adjust
 
 
 def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str:
@@ -462,7 +415,6 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
 
     integral = 0.0
     previous_error = 0.0
-    coarse_recovery = False
     loop_started_at = time.perf_counter()
     motion_started_at = loop_started_at
     last_debug_at = 0.0
@@ -497,20 +449,6 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
             print("Lost both side-wall readings. Robot stopped for safety.")
             return "side_lost"
 
-        side_delta = compute_visible_side_delta(left_filtered, right_filtered)
-        front_allows_coarse = front_filtered is None or front_filtered >= FRONT_COARSE_VERIFY_CM
-        if coarse_recovery:
-            if (
-                abs(error) <= COARSE_RECOVERY_EXIT_ERROR
-                and abs(side_delta) <= COARSE_RECOVERY_EXIT_DELTA
-            ) or not front_allows_coarse:
-                coarse_recovery = False
-        elif front_allows_coarse and (
-            abs(error) >= COARSE_RECOVERY_ENTER_ERROR
-            or abs(side_delta) >= COARSE_RECOVERY_ENTER_DELTA
-        ):
-            coarse_recovery = True
-
         now = time.perf_counter()
         dt = max(now - loop_started_at, 0.001)
         loop_started_at = now
@@ -523,9 +461,9 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
         integral_input = error * (POSITIVE_INTEGRAL_GAIN if error > 0.0 else 1.0)
         integral = clamp(integral + (integral_input * dt), -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT)
         derivative = 0.0 if mode == "trim-only" else (error - previous_error) / dt
-        kp, ki, kd, right_boost, min_adjust = get_pid_profile(front_filtered, mode, coarse_recovery)
+        kp, kd, right_boost, min_adjust = get_pid_profile(front_filtered, mode)
         control_signal = 0.0 if mode == "trim-only" else (
-            (kp * error) + (ki * integral) + (kd * derivative)
+            (kp * error) + (PID_KI * integral) + (kd * derivative)
         )
         raw_adjust = 0.0 if mode == "trim-only" else clamp(
             control_signal,
@@ -549,11 +487,11 @@ def run_forward_pid(pi: pigpio.pi, duration_s: float | None, debug: bool) -> str
         if debug and (now - last_debug_at) >= PID_DEBUG_PRINT_INTERVAL_S:
             print(
                 "[pid] "
-                f"mode={mode}{'+coarse' if coarse_recovery else ''} "
+                f"mode={mode} "
                 f"front={format_distance(front_filtered)} "
                 f"left={format_distance(left_filtered)} "
                 f"right={format_distance(right_filtered)} "
-                f"err={error:.2f} delta={side_delta:.2f} raw={control_signal:.1f} adj={adjust:.1f} "
+                f"err={error:.2f} raw={control_signal:.1f} adj={adjust:.1f} "
                 f"base=({base_left_duty:.0f},{base_right_duty:.0f}) "
                 f"pwm=({left_duty:.0f},{right_duty:.0f})"
             )
@@ -593,8 +531,10 @@ def execute_step(direction: str, duration_s: float | None, pi: pigpio.pi, debug:
     if direction == "backward":
         backward(pi, BASE_TIGHT_PWM_DUTY)
     elif direction == "left":
+        verify_side_before_turn("left", pi, debug)
         left(pi, TURN_PWM_DUTY)
     elif direction == "right":
+        verify_side_before_turn("right", pi, debug)
         right(pi, TURN_PWM_DUTY)
     elif direction == "stop":
         stop(pi)
@@ -605,6 +545,8 @@ def execute_step(direction: str, duration_s: float | None, pi: pigpio.pi, debug:
     while time.perf_counter() - start < duration_s:
         time.sleep(0.02)
     stop(pi)
+    if direction in ("left", "right"):
+        stabilize_after_turn(pi, debug)
 
 
 def main() -> None:
@@ -617,10 +559,26 @@ def main() -> None:
     setup_motors(pi)
     setup_ultrasonic(pi)
 
+    path = [
+        ("straight", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+    ]
+
     print("init_path.py ready. Predetermined path is active with side-PID forward control.")
 
     try:
-        for name, dur in PATH_STEPS:
+        for name, dur in path:
             execute_step(name, dur, pi, debug=debug)
             time.sleep(RESUME_PAUSE_S)
     except KeyboardInterrupt:
