@@ -22,25 +22,32 @@
 - 2026-03-10: Updated left ultrasonic pins to TRIG=24, ECHO=25 in ~/Robot/Rollback/left_ultra.py and ~/Robot/test/us_left_test.py for rewiring test.
 - 2026-03-11: Pushed Pi changes (left/right ultrasonic tests, pin updates, gpio diagnostic) to GitHub Cedriik/SmartRobotVision.
 - 2026-03-11: Created ~/Robot/test/us_cam_motor.py integrating camera + front/left/right ultrasonics + motor control with 1s stop confirmation sampling and 3s turn decision sampling. Rollback snapshot: ~/Robot/Rollback/us_cam_motor.py.
-- 2026-03-11: Synced `~/Robot/test/us_cam_motor.py` from the Pi into this repo as `test/us_cam_motor.py`; fixed the front-US lock/stop confirmation bug (`sampler.median("front", ...)`), and created a checkpoint snapshot `test/us_cam_motor_cp1.py`.
-- 2026-03-11: Fixed a crash path where the control loop could exit and call `pi.stop()` while the ultrasonic sampler thread was still running; now `stop_evt.set()` is called and `t_us.join()` runs (best-effort) before shutting down pigpio. Checkpoint snapshot: `test/us_cam_motor_cp2.py`.
-- 2026-03-11: Added a 2s camera-clearance resume gate in `test/us_cam_motor.py`: any camera blockage pulse resets the timer, and forward motion won’t start until camera has been continuously clear for `CAM_CLEAR_CONFIRM_SECONDS` and front ultrasonic is clear (`FRONT_CLEAR_CM=20.0`). Checkpoint snapshot: `test/us_cam_motor_cp3.py`.
-- 2026-03-11: Updated `stop_motors()` in `test/us_cam_motor.py` to also drive ENA/ENB LOW when not using PWM on EN pins (`USE_PWM_EN=False`), to ensure a hard motor stop. Checkpoint snapshot: `test/us_cam_motor_cp4.py`.
-- 2026-03-11: Added a simple hold gate in `test/us_cam_motor.py`: while (camera blocked) AND (front ultrasonic < `FRONT_STOP_CM`), keep motors stopped and do not start/turn; this prevents immediate movement during pulsing blockage. Checkpoint snapshot: `test/us_cam_motor_cp5.py`.
-- 2026-03-11: Added Checkpoint/us_cam_motor_frontworking.py (copied from test/us_cam_motor_cp5.py).
-- 2026-03-19: Created `test/init_path_AllUS.py` with front/left/right ultrasonic handling. Front blockage stops the robot, averages left/right clearance for 2s, turns only toward a side `>=20 cm`, and keeps the predetermined path commented out for safe staging. Rollback snapshots: `Rollback/init_path_AllUS.py`.
-- 2026-03-19: Replaced `test/init_path.py` with the current all-ultrasonic logic from `test/init_path_AllUS.py`. Rollback snapshot: `Rollback/init_path.py`.
-- 2026-03-19: Updated `test/init_path.py` and `test/init_path_AllUS.py` to run a single guarded 2s forward test in `main()` instead of idling.
-- 2026-03-19: Pushed `test/init_path.py`, `test/init_path_AllUS.py`, `Rollback/init_path.py`, and `Rollback/init_path_AllUS.py` to GitHub from the local PC repo as commit `4daebcf` (`Add all-ultrasonic init path logic`) because the Pi repo could not authenticate to the HTTPS remote.
-- 2026-03-19: Saved `Rollback/init_path_cp1.py` as a pre-PID checkpoint before refactoring `Rollback/init_path.py` for tight-passage work.
-- 2026-03-19: Reworked `Rollback/init_path.py` from threshold-only forward motion into side-PID forward control with differential left/right PWM, ultrasonic median sampling, front hard-stop gating, side-wall references (`LEFT_REFERENCE_CM=7.8`, `RIGHT_REFERENCE_CM=8.0`), and lower cruise PWM for narrow clearances.
-- 2026-03-19: Tuned `Rollback/init_path.py` over several live runs from Pi debug output: added then softened right-turn bias, reduced derivative aggression, reset integral on center crossing, lowered turn PWM, and relaxed `TURN_OPENING_CLEAR_CM` from `20.0` to `10.0` to match the measured turn space.
-- 2026-03-20: Saved `Rollback/init_path_cp2.py` as a checkpoint of the right-biased/trim-tuned path controller before the next timing pass.
-- 2026-03-20: Updated `Rollback/init_path.py` for faster test iteration by halving the ultrasonic trigger interval (`MIN_INTERVAL_S 0.06 -> 0.03`), halving the PID loop target (`PID_LOOP_DT_S 0.05 -> 0.025`), and reducing median-sampling sleep (`0.02 -> 0.01`).
-- 2026-03-20: Raised the right-side correction ceiling in `Rollback/init_path.py` (`PID_MAX_RIGHT_ADJUST 18.0 -> 22.0`) and extended debug output to print unclamped `raw` control so PID saturation can be distinguished from motor-response limits during tuning.
-- 2026-03-20: Saved `Rollback/init_path_cp3.py` before adding broader slant-recovery tuning to the timed-turn + PID-straight controller.
-- 2026-03-20: Saved `Rollback/init_path_CurrentConfig.py` as the exact current configuration snapshot before the next straight-line tuning pass.
-- 2026-03-20: Moved the route definition to top-level `PATH_STEPS` in `Rollback/init_path.py` for faster debugging, kept turns as fixed-timing `TURN_PWM_DUTY=80`, and increased straight-line recovery gains (`PID_KP`, `PID_KI`, `PID_KD`, positive exponential/integral weighting, right-side boost).
-- 2026-03-20: Added a two-level straight recovery model in `Rollback/init_path.py`: normal fine balancing for small in-range wall error, plus hysteresis-based `coarse` recovery for strong slant conditions using side-delta/error thresholds, with front ultrasonic used only as a near-obstacle verification gate rather than continuous steering input.
-- 2026-03-20: Saved `Rollback/init_path_PIDTuned.py` as the PID-tuned snapshot before reverting turn execution in `Rollback/init_path.py` back to fixed-timing rotation at `TURN_PWM_DUTY=80`; removed ultrasonic pre/post turn checks so straight PID recovery handles post-rotation alignment.
-- 2026-03-20: Created `~/Robot/Draft` on the Raspberry Pi and copied the current `~/Robot/Rollback/init_path.py` there as `~/Robot/Draft/init_path.py`. Mirrored the same draft into the local repo as `Draft/init_path.py` for Git tracking.
+- 2026-03-11: Updated ~/Robot/test/us_cam_motor.py to serve camera stream via Flask (/video_feed) and prefer V4L2 capture to reduce GStreamer warnings. Snapshotted to ~/Robot/Rollback/us_cam_motor.py.
+- 2026-03-11: Added HSV color detection overlays (Red/Green/Black) and obstruction HUD to the Flask stream in ~/Robot/test/us_cam_motor.py. Snapshotted to ~/Robot/Rollback/us_cam_motor.py.
+- 2026-03-11: Updated `~/Robot/test/us_cam_motor.py` debug output to hide pulse microseconds and print a compact left/right line; increased rotation duration to 2.0s.
+- 2026-03-11: Changed ~/Robot/test/us_cam_motor.py --debug output to a single-line ront/right/left cm status (throttled) and added --debug-errors for sensor error prints. Snapshotted to ~/Robot/Rollback/us_cam_motor.py.
+- 2026-03-11: Kept ultrasonic sampling and --debug output running during front blockage/turn decision by moving US reads into a background sampler and using a non-blocking state machine.
+- 2026-03-11: Added front ultrasonic-only stop lock (>=2s blocked) to `~/Robot/test/us_cam_motor.py`, confirmed by 1s median, independent of camera blockage.
+- 2026-03-11: Fixed front median sampling calls in US-only lock (`sampler.median(front, ...)`) in `~/Robot/test/us_cam_motor.py`.
+- 2026-03-11: Added 2s camera-clearance gating before resuming forward motion in ~/Robot/test/us_cam_motor.py (timer resets on any blockage pulse). Forward resumes only when camera is continuously clear and front ultrasonic clearance is 20cm. Rollback refreshed: ~/Robot/Rollback/us_cam_motor.py.
+- 2026-03-11: Updated stop_motors() in ~/Robot/test/us_cam_motor.py to also drive ENA/ENB LOW when USE_PWM_EN is false, ensuring a hard motor stop (not just IN pins low). Rollback refreshed: ~/Robot/Rollback/us_cam_motor.py.
+- 2026-03-11: Added a simple hold gate in ~/Robot/test/us_cam_motor.py: while (camera blocked) AND (front ultrasonic < FRONT_STOP_CM), keep motors stopped and do not start/turn; this prevents immediate movement during pulsing blockage. Rollback refreshed: ~/Robot/Rollback/us_cam_motor.py.
+- 2026-03-11: Created ~/Robot/Checkpoint and saved cp5 as ~/Robot/Checkpoint/us_cam_motor_frontworking.py.
+- 2026-03-19: Created ~/Robot/test/init_path_AllUS.py with front/left/right ultrasonic handling. Front blockage stops the robot, averages left/right clearance for 2s, turns only toward a side >=20cm, and keeps the predetermined path commented out for safe staging. Rollback snapshot: ~/Robot/Rollback/init_path_AllUS.py.
+
+- 2026-03-19: Replaced ~/Robot/test/init_path.py with the current ~/Robot/test/init_path_AllUS.py logic. Rollback snapshot: ~/Robot/Rollback/init_path.py.
+
+- 2026-03-19: Updated ~/Robot/test/init_path_AllUS.py and ~/Robot/test/init_path.py to run a 2s guarded forward test in main() instead of idling. Rollback snapshots refreshed in ~/Robot/Rollback.
+
+- 2026-03-19: Pushed test/init_path.py, test/init_path_AllUS.py, Rollback/init_path.py, and Rollback/init_path_AllUS.py to GitHub from the local PC repo as commit 4daebcf (Add all-ultrasonic init path logic) because the Pi repo could not authenticate to the HTTPS remote.
+
+- 2026-03-19: Re-enabled the predetermined path in ~/Robot/test/init_path_AllUS.py and ~/Robot/test/init_path.py, replacing the temporary 2s guarded forward test. Rollback snapshots refreshed in ~/Robot/Rollback.
+
+- 2026-03-19: Changed ~/Robot/test/init_path_AllUS.py and ~/Robot/test/init_path.py so straight/forward path steps no longer use timers; they now move until the front ultrasonic stops them. Timed path entries remain only for turns. Rollback snapshots refreshed in ~/Robot/Rollback.
+
+- 2026-03-19: Added 1s side-ultrasonic verification before each predetermined left/right turn in ~/Robot/test/init_path_AllUS.py and ~/Robot/test/init_path.py, plus a 1s post-turn stabilization/front check to catch misalignment or blockage after rotation. Rollback snapshots refreshed in ~/Robot/Rollback.
+
+- 2026-03-19: Replaced ~/Robot/test/init_path.py from the current init_path_AllUS.py baseline and added a first-pass proportional side-alignment controller for forward motion. While moving straight/forward, left/right ultrasonic averages now bias ENA/ENB PWM to partially correct heading; ~/Robot/test/init_path_AllUS.py was left unchanged. Rollback snapshot refreshed: ~/Robot/Rollback/init_path.py.
+- 2026-03-22: Moved ~/Robot/test/camera_test.py and ~/Robot/test/motor_test.py into ~/Robot/ per user request.
+- 2026-03-22: Moved ~/Robot/camera_test.py and ~/Robot/motor_test.py into ~/ per user clarification.
+- 2026-03-22: Created ~/robot.py merging Flask camera stream with pigpio motor/servo/ultrasonic control, adding Yellow pause latch, Green resume latch, and camera+front-ultrasonic obstacle confirmation with timed side turns + straight PID.
