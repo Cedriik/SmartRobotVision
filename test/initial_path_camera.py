@@ -11,7 +11,7 @@ from statistics import median
 import cv2
 import numpy as np
 import pigpio
-from flask import Flask, Response
+from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
@@ -24,15 +24,15 @@ RIGHT_TRIG, RIGHT_ECHO = 4, 26
 BASE_CRUISE_PWM_DUTY = 56
 BASE_TIGHT_PWM_DUTY = 40
 BASE_CRAWL_PWM_DUTY = 32
-TURN_PWM_DUTY = 90
-TURN_MICRO_PWM_DUTY = 84
+TURN_PWM_DUTY = 100
+TURN_MINI_PWM_DUTY = 95
 MIN_DRIVE_PWM_DUTY = 20
 MAX_DRIVE_PWM_DUTY = 65
 LEFT_MOTOR_TRIM_PWM = 3.0
 RIGHT_MOTOR_TRIM_PWM = 0.0
 
-FRONT_STOP_CM = 10.0
-FRONT_SLOW_CM = 18.0
+FRONT_STOP_CM = 15.0
+FRONT_SLOW_CM = 23.0
 TURN_OPENING_CLEAR_CM = 10.0
 LEFT_REFERENCE_CM = 8.6
 RIGHT_REFERENCE_CM = 7.8
@@ -58,12 +58,12 @@ PRE_TURN_VERIFY_SECONDS = 0.6
 POST_TURN_STABILIZE_SECONDS = 0.5
 TURN_SECONDS = 2.0
 TURN_COARSE_RATIO = 0.78
-TURN_MICRO_SETTLE_S = 0.05
-TURN_MICRO_FIRST_PULSE_S = 0.06
-TURN_MICRO_DOUBLE_PULSE_S = 0.12
-TURN_MICRO_MAX_TOTAL_SECONDS = 2.4
+TURN_MINI_SETTLE_S = 0.08
+TURN_MINI_FIRST_PULSE_S = 0.24
+TURN_MINI_DOUBLE_PULSE_S = 0.14
+TURN_MINI_MAX_TOTAL_SECONDS = 3.2
 TURN_FRONT_CHECK_SECONDS = 0.12
-TURN_PRE_MICRO_VERIFY_SECONDS = 1.2
+TURN_PRE_MINI_VERIFY_SECONDS = 1.2
 RESUME_PAUSE_S = 0.20
 
 PID_LOOP_DT_S = 0.025
@@ -128,10 +128,18 @@ TURN_CAMERA_SIDE_DIFF_THRESHOLD = 0.08
 SIDE_CAMERA_ROI_TOP = 0.34
 SIDE_CAMERA_ROI_BOTTOM = 0.82
 SIDE_CAMERA_ROI_WIDTH = 0.24
+TURN_CAMERA_CORRIDOR_ANGLE_OK_DEG = 10.0
+TURN_CAMERA_VANISH_OFFSET_OK = 0.20
+FEATURE_MAX_CORNERS = 80
+FEATURE_QUALITY_LEVEL = 0.01
+FEATURE_MIN_DISTANCE = 7
+FEATURE_STABLE_MOTION_PX = 1.8
+FEATURE_ROTATION_OK_DEG = 4.0
+FEATURE_CONFIDENCE_MIN = 0.25
 
-PATH_TURN_SECONDS = 2.0
+PATH_TURN_SECONDS = 1.5
 PATH_BACKWARD_SECONDS = 1.0
-PATH_SEQUENCE = [
+DEFAULT_PATH_SEQUENCE = [
     "straight",
     "right",
     "forward",
@@ -146,6 +154,7 @@ PATH_SEQUENCE = [
     "left",
     "forward",
 ]
+PATH_SEQUENCE = list(DEFAULT_PATH_SEQUENCE)
 STEP_DURATION_BY_DIRECTION = {
     "left": PATH_TURN_SECONDS,
     "right": PATH_TURN_SECONDS,
@@ -154,6 +163,7 @@ STEP_DURATION_BY_DIRECTION = {
 SENSORS = {"front": {"trig": FRONT_TRIG, "echo": FRONT_ECHO, "last_trigger": 0.0}, "left": {"trig": LEFT_TRIG, "echo": LEFT_ECHO, "last_trigger": 0.0}, "right": {"trig": RIGHT_TRIG, "echo": RIGHT_ECHO, "last_trigger": 0.0}}
 
 state_lock = threading.Lock()
+config_lock = threading.Lock()
 shutdown_event = threading.Event()
 camera_ready_event = threading.Event()
 run_enabled_event = threading.Event()
@@ -169,6 +179,13 @@ line_state = {
     "right_open": 0.0,
     "left_blocked": False,
     "right_blocked": False,
+    "corridor_angle_deg": 0.0,
+    "vanishing_offset": 0.0,
+    "geometry_confidence": 0.0,
+    "feature_motion_px": 0.0,
+    "feature_rotation_deg": 0.0,
+    "feature_confidence": 0.0,
+    "feature_stable": True,
 }
 sensor_snapshot = {"front": "invalid", "left": "invalid", "right": "invalid"}
 status_text = "idle-waiting-start"
@@ -198,8 +215,57 @@ def set_sensor_snapshot(front, left, right):
         sensor_snapshot["right"] = format_distance(right)
 
 
+def robot_paused():
+    return not run_enabled_event.is_set()
+
+
 def get_path_steps():
-    return [(direction, STEP_DURATION_BY_DIRECTION.get(direction)) for direction in PATH_SEQUENCE]
+    with config_lock:
+        return [(direction, STEP_DURATION_BY_DIRECTION.get(direction)) for direction in PATH_SEQUENCE]
+
+
+def get_control_state():
+    with config_lock, state_lock:
+        return {
+            "paused": robot_paused(),
+            "turn_seconds": PATH_TURN_SECONDS,
+            "path_sequence": list(PATH_SEQUENCE),
+            "status": status_text,
+        }
+
+
+def update_turn_seconds(seconds):
+    global PATH_TURN_SECONDS
+    with config_lock:
+        PATH_TURN_SECONDS = seconds
+        STEP_DURATION_BY_DIRECTION["left"] = seconds
+        STEP_DURATION_BY_DIRECTION["right"] = seconds
+
+
+def append_path_step(step_name):
+    with config_lock:
+        PATH_SEQUENCE.append(step_name)
+
+
+def clear_path_sequence():
+    with config_lock:
+        PATH_SEQUENCE.clear()
+
+
+def reset_default_path_sequence():
+    with config_lock:
+        PATH_SEQUENCE[:] = DEFAULT_PATH_SEQUENCE
+
+
+def edit_requires_pause():
+    if not robot_paused():
+        return Response("Pause robot before editing web controls.", status=409)
+    return None
+
+
+def mark_path_edited(message):
+    restart_requested_event.set()
+    set_status(message)
 
 
 def motion_restart_requested():
@@ -457,6 +523,149 @@ def compute_mask_open_ratio(mask, x1, y1, x2, y2):
     return float(cv2.countNonZero(roi)) / float(roi.size)
 
 
+def compute_hough_geometry(blur_roi, overlay):
+    height, width = blur_roi.shape[:2]
+    edges = cv2.Canny(blur_roi, LINE_EDGE_CANNY_LOW, LINE_EDGE_CANNY_HIGH)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180.0,
+        LINE_HOUGH_THRESHOLD,
+        minLineLength=LINE_HOUGH_MIN_LENGTH,
+        maxLineGap=LINE_HOUGH_MAX_GAP,
+    )
+
+    left_edges = []
+    right_edges = []
+    left_top_x = []
+    right_top_x = []
+    weighted_angles = []
+    weighted_lengths = []
+
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.hypot(dx, dy)
+            if length < LINE_HOUGH_MIN_LENGTH or abs(dy) < 8:
+                continue
+
+            bottom_x = line_bottom_x(x1, y1, x2, y2, height - 1.0)
+            top_x = line_bottom_x(x1, y1, x2, y2, 0.0)
+            if bottom_x is None or top_x is None:
+                continue
+
+            angle_deg = math.degrees(math.atan2(dx, dy))
+            if abs(angle_deg) > 65.0:
+                continue
+
+            weighted_angles.append(angle_deg)
+            weighted_lengths.append(length)
+            mid_x = (x1 + x2) / 2.0
+            color = (255, 0, 0) if mid_x < (width / 2.0) else (0, 0, 255)
+            cv2.line(overlay, (x1, y1), (x2, y2), color, 1)
+            if mid_x < (width / 2.0):
+                left_edges.append(bottom_x)
+                left_top_x.append(top_x)
+            else:
+                right_edges.append(bottom_x)
+                right_top_x.append(top_x)
+
+    corridor_angle_deg = 0.0
+    if weighted_lengths:
+        corridor_angle_deg = float(np.average(weighted_angles, weights=weighted_lengths))
+
+    vanishing_offset = 0.0
+    if left_top_x and right_top_x:
+        top_center = (median(left_top_x) + median(right_top_x)) / 2.0
+        vanishing_offset = clamp((top_center - (width / 2.0)) / (width / 2.0), -1.0, 1.0)
+
+    lane_center = None
+    lane_mode = "none"
+    if left_edges and right_edges:
+        lane_center = (median(left_edges) + median(right_edges)) / 2.0
+        lane_mode = "double-edge"
+    elif left_edges:
+        lane_center = median(left_edges) + LINE_SINGLE_EDGE_HALF_WIDTH_PX
+        lane_mode = "single-left"
+    elif right_edges:
+        lane_center = median(right_edges) - LINE_SINGLE_EDGE_HALF_WIDTH_PX
+        lane_mode = "single-right"
+
+    if lane_center is not None:
+        lane_center = clamp(lane_center, 0.0, float(width - 1))
+        cv2.line(overlay, (int(lane_center), 0), (int(lane_center), height - 1), (0, 255, 255), 2)
+
+    geometry_confidence = clamp((len(weighted_angles) / 8.0), 0.0, 1.0)
+    return {
+        "lane_center": lane_center,
+        "lane_mode": lane_mode,
+        "corridor_angle_deg": corridor_angle_deg,
+        "vanishing_offset": vanishing_offset,
+        "geometry_confidence": geometry_confidence,
+    }, overlay
+
+
+def compute_feature_metrics(previous_gray, current_gray):
+    if previous_gray is None or current_gray is None:
+        return {
+            "feature_motion_px": 0.0,
+            "feature_rotation_deg": 0.0,
+            "feature_confidence": 0.0,
+            "feature_stable": True,
+        }
+
+    prev_points = cv2.goodFeaturesToTrack(
+        previous_gray,
+        maxCorners=FEATURE_MAX_CORNERS,
+        qualityLevel=FEATURE_QUALITY_LEVEL,
+        minDistance=FEATURE_MIN_DISTANCE,
+    )
+    if prev_points is None or len(prev_points) < 6:
+        return {
+            "feature_motion_px": 0.0,
+            "feature_rotation_deg": 0.0,
+            "feature_confidence": 0.0,
+            "feature_stable": True,
+        }
+
+    next_points, status, _ = cv2.calcOpticalFlowPyrLK(previous_gray, current_gray, prev_points, None)
+    if next_points is None or status is None:
+        return {
+            "feature_motion_px": 0.0,
+            "feature_rotation_deg": 0.0,
+            "feature_confidence": 0.0,
+            "feature_stable": True,
+        }
+
+    good_old = prev_points[status.flatten() == 1]
+    good_new = next_points[status.flatten() == 1]
+    if len(good_old) < 6 or len(good_new) < 6:
+        return {
+            "feature_motion_px": 0.0,
+            "feature_rotation_deg": 0.0,
+            "feature_confidence": 0.0,
+            "feature_stable": True,
+        }
+
+    motion = good_new - good_old
+    mean_motion = float(np.mean(np.linalg.norm(motion, axis=1)))
+    transform, _ = cv2.estimateAffinePartial2D(good_old, good_new)
+    rotation_deg = 0.0
+    if transform is not None:
+        rotation_deg = math.degrees(math.atan2(transform[1, 0], transform[0, 0]))
+
+    confidence = clamp(len(good_old) / 24.0, 0.0, 1.0)
+    stable = mean_motion <= FEATURE_STABLE_MOTION_PX and abs(rotation_deg) <= FEATURE_ROTATION_OK_DEG
+    return {
+        "feature_motion_px": mean_motion,
+        "feature_rotation_deg": rotation_deg,
+        "feature_confidence": confidence,
+        "feature_stable": stable,
+    }
+
+
 def analyze_line(frame):
     h, w = frame.shape[:2]
     roi_y = int(h * (1.0 - LINE_ROI_HEIGHT))
@@ -477,6 +686,8 @@ def analyze_line(frame):
     corridor_dark_mask_full = cv2.morphologyEx(corridor_dark_mask_full, cv2.MORPH_CLOSE, kernel)
     corridor_bright_mask_full = cv2.morphologyEx(corridor_bright_mask_full, cv2.MORPH_OPEN, kernel)
     corridor_bright_mask_full = cv2.morphologyEx(corridor_bright_mask_full, cv2.MORPH_CLOSE, kernel)
+
+    geometry_result, _ = compute_hough_geometry(blur, cv2.cvtColor(np.zeros_like(blur), cv2.COLOR_GRAY2BGR))
 
     candidates = [
         analyze_corridor_candidate(corridor_dark_mask, "corridor-dark", w, roi.shape[0]),
@@ -515,6 +726,9 @@ def analyze_line(frame):
             "right_open": right_open,
             "left_blocked": left_open < TURN_CAMERA_SIDE_OPEN_THRESHOLD,
             "right_blocked": right_open < TURN_CAMERA_SIDE_OPEN_THRESHOLD,
+            "corridor_angle_deg": geometry_result["corridor_angle_deg"],
+            "vanishing_offset": geometry_result["vanishing_offset"],
+            "geometry_confidence": geometry_result["geometry_confidence"],
         }, overlay
 
     chosen_mask_full = corridor_dark_mask_full if cv2.countNonZero(corridor_dark_mask_full[roi_y:, :]) >= cv2.countNonZero(corridor_bright_mask_full[roi_y:, :]) else corridor_bright_mask_full
@@ -537,6 +751,13 @@ def analyze_line(frame):
         "right_open": right_open,
         "left_blocked": left_open < TURN_CAMERA_SIDE_OPEN_THRESHOLD,
         "right_blocked": right_open < TURN_CAMERA_SIDE_OPEN_THRESHOLD,
+        "corridor_angle_deg": geometry_result["corridor_angle_deg"],
+        "vanishing_offset": geometry_result["vanishing_offset"],
+        "geometry_confidence": geometry_result["geometry_confidence"],
+        "feature_motion_px": 0.0,
+        "feature_rotation_deg": 0.0,
+        "feature_confidence": 0.0,
+        "feature_stable": True,
     }
     contours, _ = cv2.findContours(dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contour, best_area = None, 0.0
@@ -557,36 +778,17 @@ def analyze_line(frame):
                 heading = clamp(float(vx) / max(abs(float(vy)), 0.35), -1.0, 1.0)
             result.update({"found": True, "mode": "line-contour", "offset": clamp((cx - (w / 2.0)) / (w / 2.0), -1.0, 1.0), "heading": heading, "confidence": clamp(best_area / (w * max(roi.shape[0], 1) * 0.20), 0.0, 1.0)})
             return result, overlay
-    edges = cv2.Canny(blur, LINE_EDGE_CANNY_LOW, LINE_EDGE_CANNY_HIGH)
-    overlay = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, LINE_HOUGH_THRESHOLD, minLineLength=LINE_HOUGH_MIN_LENGTH, maxLineGap=LINE_HOUGH_MAX_GAP)
-    left_edges, right_edges = [], []
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            bottom_x = line_bottom_x(x1, y1, x2, y2, roi.shape[0] - 1.0)
-            if bottom_x is None:
-                continue
-            mid_x = (x1 + x2) / 2.0
-            cv2.line(overlay, (x1, y1), (x2, y2), (255, 0, 0) if mid_x < (w / 2.0) else (0, 0, 255), 2)
-            if mid_x < (w / 2.0):
-                left_edges.append(bottom_x)
-            else:
-                right_edges.append(bottom_x)
-    lane_center, mode = None, "none"
-    if left_edges and right_edges:
-        lane_center = (median(left_edges) + median(right_edges)) / 2.0
-        mode = "double-edge"
-    elif left_edges:
-        lane_center = median(left_edges) + LINE_SINGLE_EDGE_HALF_WIDTH_PX
-        mode = "single-left"
-    elif right_edges:
-        lane_center = median(right_edges) - LINE_SINGLE_EDGE_HALF_WIDTH_PX
-        mode = "single-right"
+    overlay = cv2.cvtColor(cv2.Canny(blur, LINE_EDGE_CANNY_LOW, LINE_EDGE_CANNY_HIGH), cv2.COLOR_GRAY2BGR)
+    geometry_result, overlay = compute_hough_geometry(blur, overlay)
+    lane_center = geometry_result["lane_center"]
+    mode = geometry_result["lane_mode"]
     if lane_center is not None:
-        lane_center = clamp(lane_center, 0.0, float(w - 1))
-        cv2.line(overlay, (int(lane_center), 0), (int(lane_center), roi.shape[0] - 1), (0, 255, 255), 2)
         result.update({"found": True, "mode": mode, "offset": clamp((lane_center - (w / 2.0)) / (w / 2.0), -1.0, 1.0), "heading": 0.0, "confidence": 0.55 if mode == "double-edge" else 0.35})
+    result.update({
+        "corridor_angle_deg": geometry_result["corridor_angle_deg"],
+        "vanishing_offset": geometry_result["vanishing_offset"],
+        "geometry_confidence": geometry_result["geometry_confidence"],
+    })
     return result, overlay
 
 
@@ -599,6 +801,7 @@ def camera_worker():
         return
     camera_ready_event.set()
     set_status("[camera] ready")
+    previous_feature_gray = None
     try:
         while not shutdown_event.is_set():
             ok, frame = cap.read()
@@ -608,6 +811,9 @@ def camera_worker():
             result, roi_overlay = analyze_line(frame)
             h, w = frame.shape[:2]
             roi_y = int(h * (1.0 - LINE_ROI_HEIGHT))
+            current_feature_gray = cv2.cvtColor(frame[roi_y:, :], cv2.COLOR_BGR2GRAY)
+            result.update(compute_feature_metrics(previous_feature_gray, current_feature_gray))
+            previous_feature_gray = current_feature_gray
             with state_lock:
                 line_state.update(result)
                 current_status = status_text
@@ -622,6 +828,8 @@ def camera_worker():
                 current_status,
                 f"LINE {result['mode']} found={result['found']} conf={float(result['confidence']):.2f}",
                 f"OFFSET={float(result['offset']):+.2f} HEADING={float(result['heading']):+.2f}",
+                f"ANGLE={float(result['corridor_angle_deg']):+.1f} VP={float(result['vanishing_offset']):+.2f}",
+                f"FEAT M:{float(result['feature_motion_px']):.2f} R:{float(result['feature_rotation_deg']):+.1f} {'S' if result['feature_stable'] else 'U'}",
                 f"CAM SIDE L:{float(result['left_open']):.2f}{'B' if result['left_blocked'] else ''} R:{float(result['right_open']):.2f}{'B' if result['right_blocked'] else ''}",
                 f"ULTRA F:{front_text} L:{left_text} R:{right_text}",
             ]
@@ -660,6 +868,13 @@ def get_camera_turn_alignment():
         right_open = float(line_state["right_open"])
         left_blocked = bool(line_state["left_blocked"])
         right_blocked = bool(line_state["right_blocked"])
+        corridor_angle_deg = float(line_state["corridor_angle_deg"])
+        vanishing_offset = float(line_state["vanishing_offset"])
+        geometry_confidence = float(line_state["geometry_confidence"])
+        feature_motion_px = float(line_state["feature_motion_px"])
+        feature_rotation_deg = float(line_state["feature_rotation_deg"])
+        feature_confidence = float(line_state["feature_confidence"])
+        feature_stable = bool(line_state["feature_stable"])
 
     if not found or confidence < TURN_CAMERA_MIN_CONFIDENCE:
         return {
@@ -669,13 +884,35 @@ def get_camera_turn_alignment():
             "reason": f"camera-weak mode={mode} conf={confidence:.2f}",
         }
 
-    turn_signal = (offset + (heading * TURN_CAMERA_ALIGN_GAIN))
+    turn_signal = (
+        offset
+        + (heading * TURN_CAMERA_ALIGN_GAIN)
+        + vanishing_offset
+        + (corridor_angle_deg / 45.0)
+    )
     side_bias = right_open - left_open
+    geometry_aligned = (
+        geometry_confidence < TURN_CAMERA_MIN_CONFIDENCE
+        or (
+            abs(corridor_angle_deg) <= TURN_CAMERA_CORRIDOR_ANGLE_OK_DEG
+            and abs(vanishing_offset) <= TURN_CAMERA_VANISH_OFFSET_OK
+        )
+    )
+    feature_ok = (
+        feature_confidence < FEATURE_CONFIDENCE_MIN
+        or (
+            feature_stable
+            and abs(feature_rotation_deg) <= FEATURE_ROTATION_OK_DEG
+            and feature_motion_px <= FEATURE_STABLE_MOTION_PX
+        )
+    )
     if (
         abs(offset) <= TURN_CAMERA_OFFSET_OK
         and abs(heading) <= TURN_CAMERA_HEADING_OK
         and not (left_blocked ^ right_blocked)
         and abs(side_bias) <= TURN_CAMERA_SIDE_DIFF_THRESHOLD
+        and geometry_aligned
+        and feature_ok
     ):
         return {
             "usable": True,
@@ -683,7 +920,20 @@ def get_camera_turn_alignment():
             "direction": None,
             "reason": (
                 f"camera-aligned mode={mode} off={offset:+.2f} "
-                f"head={heading:+.2f} side={side_bias:+.2f} conf={confidence:.2f}"
+                f"head={heading:+.2f} side={side_bias:+.2f} "
+                f"ang={corridor_angle_deg:+.1f} vp={vanishing_offset:+.2f} "
+                f"feat={feature_rotation_deg:+.1f}/{feature_motion_px:.2f} conf={confidence:.2f}"
+            ),
+        }
+
+    if not feature_ok:
+        return {
+            "usable": True,
+            "aligned": False,
+            "direction": "right" if turn_signal > 0 else "left",
+            "reason": (
+                f"camera-feature-unstable mode={mode} rot={feature_rotation_deg:+.1f} "
+                f"motion={feature_motion_px:.2f} conf={feature_confidence:.2f}"
             ),
         }
 
@@ -718,7 +968,9 @@ def get_camera_turn_alignment():
         "direction": "right" if turn_signal > 0 else "left",
         "reason": (
             f"camera-correct mode={mode} off={offset:+.2f} "
-            f"head={heading:+.2f} side={side_bias:+.2f} conf={confidence:.2f}"
+            f"head={heading:+.2f} side={side_bias:+.2f} "
+            f"ang={corridor_angle_deg:+.1f} vp={vanishing_offset:+.2f} "
+            f"feat={feature_rotation_deg:+.1f}/{feature_motion_px:.2f} conf={confidence:.2f}"
         ),
     }
 
@@ -784,20 +1036,20 @@ def front_clear_for_turn(pi, debug):
     return clear, front_avg
 
 
-def verify_turn_before_micro(direction, pi, debug):
+def verify_turn_before_mini(direction, pi, debug):
     if not wait_until_run_enabled(pi):
         return True
 
     print(
-        f"Verifying post-turn distances for {TURN_PRE_MICRO_VERIFY_SECONDS:.1f}s "
-        "before micro-correction"
+        f"Verifying post-turn distances for {TURN_PRE_MINI_VERIFY_SECONDS:.1f}s "
+        "before mini-pulse correction"
     )
-    front_avg = average_distance(pi, "front", TURN_PRE_MICRO_VERIFY_SECONDS, debug=debug)
-    left_avg = average_distance(pi, "left", TURN_PRE_MICRO_VERIFY_SECONDS * 0.7, debug=debug)
-    right_avg = average_distance(pi, "right", TURN_PRE_MICRO_VERIFY_SECONDS * 0.7, debug=debug)
+    front_avg = average_distance(pi, "front", TURN_PRE_MINI_VERIFY_SECONDS, debug=debug)
+    left_avg = average_distance(pi, "left", TURN_PRE_MINI_VERIFY_SECONDS * 0.7, debug=debug)
+    right_avg = average_distance(pi, "right", TURN_PRE_MINI_VERIFY_SECONDS * 0.7, debug=debug)
     aligned, pulse_direction, reason = choose_micro_direction(direction, front_avg, left_avg, right_avg)
     print(
-        "[pre-micro] "
+        "[pre-mini] "
         f"front={format_distance(front_avg)} "
         f"left={format_distance(left_avg)} "
         f"right={format_distance(right_avg)} -> {reason}"
@@ -807,10 +1059,10 @@ def verify_turn_before_micro(direction, pi, debug):
     return False
 
 
-def micro_adjust_after_turn(direction, pi, debug):
+def mini_adjust_after_turn(direction, pi, debug):
     started_at = time.perf_counter()
     step = 0
-    while (time.perf_counter() - started_at) < TURN_MICRO_MAX_TOTAL_SECONDS and not shutdown_event.is_set():
+    while (time.perf_counter() - started_at) < TURN_MINI_MAX_TOTAL_SECONDS and not shutdown_event.is_set():
         step += 1
         if motion_restart_requested():
             return "restart"
@@ -820,19 +1072,19 @@ def micro_adjust_after_turn(direction, pi, debug):
         left_avg = average_distance(pi, "left", 0.12, debug=debug)
         right_avg = average_distance(pi, "right", 0.12, debug=debug)
         aligned, pulse_direction, reason = choose_micro_direction(direction, front_avg, left_avg, right_avg)
-        print(f"[micro-turn {step}] front={format_distance(front_avg)} left={format_distance(left_avg)} right={format_distance(right_avg)} -> {reason}")
+        print(f"[mini-turn {step}] front={format_distance(front_avg)} left={format_distance(left_avg)} right={format_distance(right_avg)} -> {reason}")
         if aligned or pulse_direction is None:
             return "aligned"
         clear_now, front_check = front_clear_for_turn(pi, debug)
         if not clear_now:
-            print(f"[micro-turn {step}] front still not clear ({format_distance(front_check)}), pulsing {direction} with stronger turn power")
+            print(f"[mini-turn {step}] front still not clear ({format_distance(front_check)}), pulsing {direction} with stronger turn power")
             pulse_direction = direction
-        pulse_seconds = TURN_MICRO_FIRST_PULSE_S if step == 1 else TURN_MICRO_DOUBLE_PULSE_S
-        result = perform_turn(pulse_direction, pulse_seconds, pi, TURN_MICRO_PWM_DUTY)
+        pulse_seconds = TURN_MINI_FIRST_PULSE_S if step == 1 else TURN_MINI_DOUBLE_PULSE_S
+        result = perform_turn(pulse_direction, pulse_seconds, pi, TURN_MINI_PWM_DUTY)
         if result != "ok":
             return result
-        time.sleep(TURN_MICRO_SETTLE_S)
-    print(f"[micro-turn] correction window ended after {time.perf_counter() - started_at:.2f}s")
+        time.sleep(TURN_MINI_SETTLE_S)
+    print(f"[mini-turn] correction window ended after {time.perf_counter() - started_at:.2f}s")
     return "timeout"
 
 
@@ -854,13 +1106,13 @@ def execute_turn_with_micro(direction, duration_s, pi, debug):
     clear_now, front_check = front_clear_for_turn(pi, debug)
     if not clear_now:
         print(f"Pre-turn front not clear ({format_distance(front_check)}). Applying stronger coarse turn.")
-    print(f"{direction} coarse turn for {coarse_duration:.2f}s, then micro-adjust")
+    print(f"{direction} coarse turn for {coarse_duration:.2f}s, then mini-pulse adjust")
     result = perform_turn(direction, coarse_duration, pi, TURN_PWM_DUTY)
     if result != "ok":
         return result
-    time.sleep(TURN_MICRO_SETTLE_S)
-    if not verify_turn_before_micro(direction, pi, debug):
-        result = micro_adjust_after_turn(direction, pi, debug)
+    time.sleep(TURN_MINI_SETTLE_S)
+    if not verify_turn_before_mini(direction, pi, debug):
+        result = mini_adjust_after_turn(direction, pi, debug)
         if result in ("restart", "paused"):
             return result
     stabilize_after_turn(pi, debug)
@@ -940,6 +1192,8 @@ def run_forward_with_camera(duration_s, pi, debug):
 
 def execute_step(direction, duration_s, pi, debug):
     direction = direction.strip().lower()
+    if direction == "center":
+        direction = "straight"
     if not wait_until_run_enabled(pi):
         return "paused"
     if direction in ("forward", "straight"):
@@ -1017,32 +1271,115 @@ def frame_generator():
 
 @app.route('/')
 def index():
-    return (
-        '<html><body style="background:#000;color:#0f0;font-family:monospace;text-align:center">'
-        '<h3>INITIAL PATH CAMERA</h3>'
-        '<div id="ui_status" style="margin:8px 0;color:#8f8">Ready</div>'
-        '<div style="margin:12px 0">'
-        '<button onclick="sendCmd(\'/start\')" style="color:#0f0;background:#111;border:1px solid #0f0;padding:8px 16px;margin:0 12px">START</button>'
-        '<button onclick="sendCmd(\'/pause\')" style="color:#ff0;background:#111;border:1px solid #ff0;padding:8px 16px;margin:0 12px">PAUSE</button>'
-        '<button onclick="sendCmd(\'/restart\')" style="color:#0ff;background:#111;border:1px solid #0ff;padding:8px 16px;margin:0 12px">RESTART</button>'
-        '<a href="/stop_server" style="color:#f66;margin:0 12px">SHUTDOWN</a>'
-        '</div>'
-        '<img src="/video_feed" style="max-width:90%;border:2px solid #222">'
-        '<script>'
-        'async function sendCmd(path) {'
-        '  const el = document.getElementById("ui_status");'
-        '  el.textContent = "Sending command...";'
-        '  try {'
-        '    const res = await fetch(path, {method: "POST"});'
-        '    const text = await res.text();'
-        '    el.textContent = text || "OK";'
-        '  } catch (err) {'
-        '    el.textContent = "Command failed";'
-        '  }'
-        '}'
-        '</script>'
-        '</body></html>'
-    )
+    return '''
+<html>
+<body style="background:#000;color:#0f0;font-family:monospace;text-align:center">
+<h3>INITIAL PATH CAMERA</h3>
+<div id="ui_status" style="margin:8px 0;color:#8f8">Ready</div>
+<div id="pause_state" style="margin:6px 0;color:#ccc">Checking control state...</div>
+<div style="margin:12px 0">
+  <button onclick="sendCmd('/start')" style="color:#0f0;background:#111;border:1px solid #0f0;padding:8px 16px;margin:0 12px">START</button>
+  <button onclick="sendCmd('/pause')" style="color:#ff0;background:#111;border:1px solid #ff0;padding:8px 16px;margin:0 12px">PAUSE</button>
+  <button onclick="sendCmd('/restart')" style="color:#0ff;background:#111;border:1px solid #0ff;padding:8px 16px;margin:0 12px">RESTART</button>
+  <a href="/stop_server" style="color:#f66;margin:0 12px">SHUTDOWN</a>
+</div>
+<div style="margin:14px auto;padding:12px;max-width:900px;border:1px solid #333;background:#0a0a0a">
+  <div style="margin-bottom:8px;color:#9ff">Paused-only editor</div>
+  <div style="margin-bottom:10px">
+    <label for="turn_seconds">Turn seconds</label>
+    <input id="turn_seconds" class="pause-only" type="number" min="0.1" max="10" step="0.05" style="width:90px;margin:0 8px;background:#111;color:#0f0;border:1px solid #355;padding:6px">
+    <button class="pause-only" onclick="setTurnSeconds()" style="color:#9ff;background:#111;border:1px solid #0ff;padding:6px 12px">APPLY TURN</button>
+  </div>
+  <div style="margin-bottom:10px">
+    <button class="pause-only" onclick="appendPathStep('straight')" style="color:#0f0;background:#111;border:1px solid #0f0;padding:6px 12px;margin:0 6px">STRAIGHT</button>
+    <button class="pause-only" onclick="appendPathStep('left')" style="color:#ff0;background:#111;border:1px solid #ff0;padding:6px 12px;margin:0 6px">LEFT</button>
+    <button class="pause-only" onclick="appendPathStep('right')" style="color:#0ff;background:#111;border:1px solid #0ff;padding:6px 12px;margin:0 6px">RIGHT</button>
+    <button class="pause-only" onclick="appendPathStep('center')" style="color:#f9f;background:#111;border:1px solid #f9f;padding:6px 12px;margin:0 6px">CENTER</button>
+  </div>
+  <div style="margin-bottom:10px">
+    <button class="pause-only" onclick="clearPath()" style="color:#f66;background:#111;border:1px solid #f66;padding:6px 12px;margin:0 6px">CLEAR PATH</button>
+    <button class="pause-only" onclick="resetDefaultPath()" style="color:#fff;background:#111;border:1px solid #888;padding:6px 12px;margin:0 6px">RESET DEFAULT</button>
+  </div>
+  <div id="path_view" style="color:#ddd;word-break:break-word">Path: loading...</div>
+</div>
+<img src="/video_feed" style="max-width:90%;border:2px solid #222">
+<script>
+async function sendCmd(path) {
+  const el = document.getElementById("ui_status");
+  el.textContent = "Sending command...";
+  try {
+    const res = await fetch(path, {method: "POST"});
+    const text = await res.text();
+    el.textContent = text || "OK";
+  } catch (err) {
+    el.textContent = "Command failed";
+  }
+  await loadState();
+}
+
+function setPauseOnlyEnabled(paused) {
+  const controls = document.querySelectorAll(".pause-only");
+  controls.forEach((node) => {
+    node.disabled = !paused;
+    node.style.opacity = paused ? "1" : "0.45";
+    node.style.cursor = paused ? "pointer" : "not-allowed";
+  });
+  document.getElementById("pause_state").textContent = paused
+    ? "Robot paused. Route and turn timing can be edited."
+    : "Robot running. Pause first to edit route and turn timing.";
+}
+
+async function loadState() {
+  try {
+    const res = await fetch("/control_state");
+    const data = await res.json();
+    setPauseOnlyEnabled(data.paused);
+    document.getElementById("turn_seconds").value = Number(data.turn_seconds).toFixed(2);
+    document.getElementById("path_view").textContent = "Path: " + (data.path_sequence.length ? data.path_sequence.join(" -> ") : "(empty)");
+  } catch (err) {
+    document.getElementById("ui_status").textContent = "Failed to load control state";
+  }
+}
+
+async function postJson(path, payload) {
+  const el = document.getElementById("ui_status");
+  el.textContent = "Applying edit...";
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload || {})
+    });
+    const text = await res.text();
+    el.textContent = text || "OK";
+  } catch (err) {
+    el.textContent = "Edit failed";
+  }
+  await loadState();
+}
+
+async function setTurnSeconds() {
+  const value = Number(document.getElementById("turn_seconds").value);
+  await postJson("/set_turn_seconds", {seconds: value});
+}
+
+async function appendPathStep(step) {
+  await postJson("/path/add", {step: step});
+}
+
+async function clearPath() {
+  await postJson("/path/clear", {});
+}
+
+async function resetDefaultPath() {
+  await postJson("/path/reset_default", {});
+}
+
+loadState();
+</script>
+</body>
+</html>
+'''
 
 
 @app.route('/start', methods=['POST'])
@@ -1065,6 +1402,62 @@ def restart_robot():
     run_enabled_event.set()
     set_status("[nav] restart requested from web")
     return "Robot restart requested."
+
+
+@app.route('/control_state')
+def control_state():
+    return jsonify(get_control_state())
+
+
+@app.route('/set_turn_seconds', methods=['POST'])
+def set_turn_seconds():
+    blocked = edit_requires_pause()
+    if blocked is not None:
+        return blocked
+    payload = request.get_json(silent=True) or {}
+    try:
+        seconds = float(payload.get("seconds", 0.0))
+    except (TypeError, ValueError):
+        return Response("Invalid turn seconds.", status=400)
+    if not 0.1 <= seconds <= 10.0:
+        return Response("Turn seconds must be between 0.1 and 10.0.", status=400)
+    update_turn_seconds(seconds)
+    mark_path_edited(f"[nav] turn timing updated to {seconds:.2f}s while paused")
+    return f"Turn timing updated to {seconds:.2f}s. Press START or RESTART when ready."
+
+
+@app.route('/path/add', methods=['POST'])
+def path_add():
+    blocked = edit_requires_pause()
+    if blocked is not None:
+        return blocked
+    payload = request.get_json(silent=True) or {}
+    step_name = str(payload.get("step", "")).strip().lower()
+    if step_name not in {"straight", "left", "right", "center"}:
+        return Response("Invalid path step.", status=400)
+    append_path_step(step_name)
+    mark_path_edited(f"[nav] path step appended: {step_name}")
+    return f"Added path step: {step_name}. Path will restart from step 0 on next START."
+
+
+@app.route('/path/clear', methods=['POST'])
+def path_clear():
+    blocked = edit_requires_pause()
+    if blocked is not None:
+        return blocked
+    clear_path_sequence()
+    mark_path_edited("[nav] path cleared from web")
+    return "Path cleared. Add new steps before START."
+
+
+@app.route('/path/reset_default', methods=['POST'])
+def path_reset_default():
+    blocked = edit_requires_pause()
+    if blocked is not None:
+        return blocked
+    reset_default_path_sequence()
+    mark_path_edited("[nav] path reset to default from web")
+    return "Path reset to default. Press START or RESTART when ready."
 
 
 @app.route('/video_feed')
