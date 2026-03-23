@@ -67,3 +67,5 @@
 2026-03-23: Adjusted mini-turn timing so the first correction pulse is stronger (0.24s) and follow-up pulses are shorter (0.14s), based on live motor behavior where the first pulse rotates reliably.
 
 2026-03-23: Added paused-only web editor to initial_path_camera.py for turn timing and route editing. Added /control_state, /set_turn_seconds, /path/add, /path/clear, and /path/reset_default. Route edits now mark the path for restart-from-step-0 on the next START.
+
+2026-03-23: Added checkpoint snapshot Checkpoint/init_path_camera_cp1.py from the current initial_path_camera.py state before further turn-trigger changes.
