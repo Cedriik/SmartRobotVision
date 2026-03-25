@@ -69,3 +69,10 @@
 2026-03-23: Added paused-only web editor to initial_path_camera.py for turn timing and route editing. Added /control_state, /set_turn_seconds, /path/add, /path/clear, and /path/reset_default. Route edits now mark the path for restart-from-step-0 on the next START.
 
 2026-03-23: Added checkpoint snapshot Checkpoint/init_path_camera_cp1.py from the current initial_path_camera.py state before further turn-trigger changes.
+2026-03-23: Changed mini-turn triggering in initial_path_camera.py from one-shot checks to vote-based camera+ultrasonic confirmation. Mini-turn now starts only after repeated confirmed misalignment, and repeated re-checks gate each follow-up pulse.
+
+2026-03-23: Split paused-only editor out of the main web page into /editor, renamed the UI label to Smart Robotic Car, and forced camera capture to 960x540 to reduce stream load while keeping 16:9.
+
+2026-03-23: Rolled back the forced 960x540 camera capture setting in initial_path_camera.py and returned camera resolution selection to the default device behavior.
+
+2026-03-23: Rebased robot.py onto the current initial_path_camera.py flow and added the older servo/yellow-green color logic only as commented scaffolding. Active robot.py behavior remains the initial_path_camera web server and navigation path until those hooks are explicitly enabled.

@@ -246,13 +246,30 @@ def execute_forward_with_all_us(duration_s: float, pi: pigpio.pi, debug: bool) -
     stop(pi)
 
 
-def execute_step(direction: str, duration_s: float, pi: pigpio.pi, debug: bool) -> None:
+def execute_forward_until_blocked(pi: pigpio.pi, debug: bool) -> None:
+    forward(pi)
+
+    while True:
+        dist = get_distance_cm(pi, "front", debug=debug)
+        if dist is not None and dist < FRONT_STOP_CM:
+            stop(pi)
+            print(f"Front blocked at {dist:.1f} cm")
+            return
+        time.sleep(0.02)
+
+
+def execute_step(direction: str, duration_s: float | None, pi: pigpio.pi, debug: bool) -> None:
     direction = direction.strip().lower()
-    print(f"{direction} for {duration_s:.1f}s")
 
     if direction in ("forward", "straight"):
-        execute_forward_with_all_us(duration_s, pi, debug)
+        print(f"{direction} until front ultrasonic stop")
+        execute_forward_until_blocked(pi, debug)
         return
+
+    if duration_s is None:
+        raise ValueError(f"Timed direction requires a duration: {direction}")
+
+    print(f"{direction} for {duration_s:.1f}s")
 
     if direction == "backward":
         backward(pi)
@@ -281,34 +298,28 @@ def main() -> None:
     setup_motors(pi)
     setup_ultrasonic(pi)
 
-    # Predetermined path disabled for now to avoid conflicts while validating
-    # the all-ultrasonic turn-decision logic.
-    #
-    # path = [
-    #     ("straight", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("right", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    #     ("left", 1.0),
-    #     ("forward", 1.0),
-    # ]
-    #
-    # for name, dur in path:
-    #     execute_step(name, dur, pi, debug=debug)
-    #     time.sleep(0.2)
+    path = [
+        ("straight", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("right", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+        ("left", 1.0),
+        ("forward", None),
+    ]
 
-    print("init_path_AllUS.py ready. Predetermined path is commented out in main().")
+    print("init_path_AllUS.py ready. Predetermined path is active in main().")
 
     try:
-        while True:
-            time.sleep(0.5)
+        for name, dur in path:
+            execute_step(name, dur, pi, debug=debug)
+            time.sleep(0.2)
     except KeyboardInterrupt:
         print("\nStopped by user")
     finally:

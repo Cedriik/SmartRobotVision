@@ -1,5 +1,3 @@
-# NOTE: Rotation timings should be calibrated for your robot and surface.
-
 import sys
 import time
 
@@ -31,6 +29,10 @@ ECHO_GLITCH_US = 350
 STUCK_HIGH_RECOVER_S = 0.01
 LOCK_DISTANCE_CM = 1000.0
 LOCK_TOLERANCE_CM = 120.0
+
+# Avoidance turn when blocked during forward
+AVOID_TURN_DIR = "right"
+AVOID_TURN_SECONDS = 1.0
 
 
 def setup_motors(pi: pigpio.pi) -> None:
@@ -153,16 +155,31 @@ def drive_turn(direction: str, duration_s: float, pi: pigpio.pi) -> None:
     stop(pi)
 
 
-def execute_forward_with_us(pi: pigpio.pi, debug: bool) -> None:
+def execute_forward_with_us(duration_s: float, pi: pigpio.pi, debug: bool) -> None:
     forward(pi)
-    while True:
+    start = time.perf_counter()
+
+    while time.perf_counter() - start < duration_s:
         dist = get_distance_cm(pi, debug=debug)
         if dist is not None and dist < STOP_CM:
             stop(pi)
             if debug:
-                print(f"[debug] blocked at {dist:.1f} cm -> stop forward")
-            break
+                print(f"[debug] blocked at {dist:.1f} cm -> avoid {AVOID_TURN_DIR}")
+
+            # Turn based on time only, then resume forward for remaining time.
+            drive_turn(AVOID_TURN_DIR, AVOID_TURN_SECONDS, pi)
+
+            # Wait until clear before continuing.
+            while True:
+                dist = get_distance_cm(pi, debug=debug)
+                if dist is not None and dist >= CLEAR_CM:
+                    break
+                time.sleep(0.05)
+
+            forward(pi)
         time.sleep(0.02)
+
+    stop(pi)
 
 
 def execute_step(direction: str, duration_s: float, pi: pigpio.pi, debug: bool) -> None:
@@ -170,7 +187,7 @@ def execute_step(direction: str, duration_s: float, pi: pigpio.pi, debug: bool) 
     print(f"{direction} for {duration_s:.1f}s")
 
     if direction in ("forward", "straight"):
-        execute_forward_with_us(pi, debug)
+        execute_forward_with_us(duration_s, pi, debug)
         return
 
     if direction == "backward":
