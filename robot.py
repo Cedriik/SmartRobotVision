@@ -26,9 +26,9 @@ FRONT_TRIG, FRONT_ECHO = 18, 19
 LEFT_TRIG, LEFT_ECHO = 24, 25
 RIGHT_TRIG, RIGHT_ECHO = 4, 26
 SERVO_PIN = 16
-SERVO_HOME_US = 1500
-SERVO_ALERT_US = 2150
-SERVO_REVERSE_US = SERVO_ALERT_US
+SERVO_HOME_US = 500
+SERVO_ALERT_US = 1300
+SERVO_REVERSE_US = SERVO_HOME_US
 SERVO_SETTLE_S = 0.25
 
 BASE_CRUISE_PWM_DUTY = 56
@@ -75,6 +75,8 @@ TURN_MINI_MAX_TOTAL_SECONDS = 3.2
 TURN_FRONT_CHECK_SECONDS = 0.12
 TURN_PRE_MINI_VERIFY_SECONDS = 1.2
 RESUME_PAUSE_S = 0.20
+RESUME_STRAIGHT_PWM = 70.0
+RESUME_STRAIGHT_SECONDS = 2.0
 
 PID_LOOP_DT_S = 0.025
 PID_FILTER_ALPHA = 0.30
@@ -147,24 +149,24 @@ FEATURE_STABLE_MOTION_PX = 1.8
 FEATURE_ROTATION_OK_DEG = 4.0
 FEATURE_CONFIDENCE_MIN = 0.25
 COLOR_LOCK_FRAMES = 8
+YELLOW_LOCK_FRAMES = 1
 COLOR_RELEASE_FRAMES = 3
-COLOR_BRIGHTNESS_TOLERANCE = 0.10
-RED_BRIGHTNESS_TOLERANCE = 0.02
+COLOR_BRIGHTNESS_TOLERANCE = 0.20
 COLOR_TRIGGER_COOLDOWN_S = 3.0
+YELLOW_TRIGGER_COOLDOWN_S = 10.0
 BOX_HOLD_FRAMES = 3
 COLORS = {
-    "Red": [
-        (np.array([0, 200, 200]), np.array([4, 255, 255])),
-        (np.array([176, 200, 200]), np.array([180, 255, 255])),
+    "Yellow": [
+        (np.array([20, 120, 120]), np.array([35, 255, 255])),
     ],
     "Green": [(np.array([55, 120, 60]), np.array([85, 255, 255]))],
 }
 COLOR_BOXES = {
-    "Red": (0, 0, 255),
+    "Yellow": (0, 255, 255),
     "Green": (0, 255, 0),
 }
 COLOR_MIN_AREA = {
-    "Red": 300,
+    "Yellow": 300,
     "Green": 250,
 }
 
@@ -204,6 +206,7 @@ latest_locked_color = "None"
 yellow_pause_latched = False
 servo_is_alert = False
 vision_detail_text = "no-color-lock"
+resume_boost_until = 0.0
 line_state = {
     "found": False,
     "mode": "none",
@@ -276,9 +279,9 @@ def set_yellow_pause(active):
             changed = True
     if changed:
         if active:
-            set_status("[vision] red locked - waiting for green")
+            set_status("[vision] yellow locked - waiting for green")
         else:
-            set_status("[vision] green locked - red pause cleared")
+            set_status("[vision] green locked - yellow pause cleared")
 
 
 def is_yellow_paused():
@@ -344,13 +347,19 @@ def motion_restart_requested():
 
 
 def wait_until_run_enabled(pi):
+    global resume_boost_until
+    was_paused = False
     while not shutdown_event.is_set() and (not run_enabled_event.is_set() or is_yellow_paused()):
+        was_paused = True
         stop(pi)
         if is_yellow_paused():
-            set_status("[nav] paused by red - waiting for green")
+            set_status("[nav] paused by yellow - waiting for green")
         else:
             set_status("[nav] paused - press START")
         time.sleep(0.05)
+    if not shutdown_event.is_set() and was_paused:
+        resume_boost_until = time.perf_counter() + RESUME_STRAIGHT_SECONDS
+        set_status(f"[nav] smooth resume - holding PWM {RESUME_STRAIGHT_PWM:.0f}")
     return not shutdown_event.is_set()
 
 
@@ -383,7 +392,7 @@ def cleanup_ultrasonic(pi):
 
 def setup_servo(pi):
     pi.set_mode(SERVO_PIN, pigpio.OUTPUT)
-    set_servo_reverse(pi)
+    set_servo_home(pi)
 
 
 def set_servo_home(pi):
@@ -897,7 +906,15 @@ def analyze_line(frame):
 
 
 def color_brightness_tolerance(color_name):
-    return RED_BRIGHTNESS_TOLERANCE if color_name == "Red" else COLOR_BRIGHTNESS_TOLERANCE
+    return COLOR_BRIGHTNESS_TOLERANCE
+
+
+def color_trigger_cooldown(color_name):
+    return YELLOW_TRIGGER_COOLDOWN_S if color_name == "Yellow" else COLOR_TRIGGER_COOLDOWN_S
+
+
+def color_lock_frames(color_name):
+    return YELLOW_LOCK_FRAMES if color_name == "Yellow" else COLOR_LOCK_FRAMES
 
 
 def adjusted_color_range(color_name, low, high):
@@ -957,22 +974,24 @@ def update_color_memory(frame):
             else:
                 mem["box"] = None
 
-        is_locked = mem["consecutive"] >= COLOR_LOCK_FRAMES
+        is_locked = mem["consecutive"] >= color_lock_frames(color_name)
+        trigger_enabled = run_enabled_event.is_set() or color_name != "Yellow"
         cooldown_remaining = max(0.0, color_cooldowns[color_name] - now)
-        if is_locked and cooldown_remaining <= 0.0 and mem["area"] >= locked_area:
+        if is_locked and trigger_enabled and cooldown_remaining <= 0.0 and mem["area"] >= locked_area:
             locked_color = color_name
             locked_area = mem["area"]
-        elif is_locked and cooldown_remaining > 0.0:
+        elif is_locked and trigger_enabled and cooldown_remaining > 0.0:
             cooldown_text.append(f"{color_name}:{cooldown_remaining:.1f}s")
 
         if mem["box"] is not None and mem["frames"] > 0:
             visual_items.append((color_name, mem["box"], mem["area"], is_locked, cooldown_remaining))
 
     if locked_color != "None":
-        color_cooldowns[locked_color] = now + COLOR_TRIGGER_COOLDOWN_S
+        hold_seconds = color_trigger_cooldown(locked_color)
+        color_cooldowns[locked_color] = now + hold_seconds
     set_locked_color(locked_color)
     if locked_color != "None":
-        set_vision_detail(f"trigger={locked_color} hold={COLOR_TRIGGER_COOLDOWN_S:.1f}s")
+        set_vision_detail(f"trigger={locked_color} hold={hold_seconds:.1f}s")
     elif cooldown_text:
         set_vision_detail(f"cooldown {' '.join(cooldown_text)}")
     else:
@@ -1004,7 +1023,7 @@ def camera_worker(pi):
             result.update(compute_feature_metrics(previous_feature_gray, current_feature_gray))
             previous_feature_gray = current_feature_gray
             locked = latest_locked_color
-            if locked == "Red":
+            if locked == "Yellow":
                 if not is_yellow_paused():
                     set_yellow_pause(True)
                 if not servo_is_alert:
@@ -1323,6 +1342,7 @@ def execute_turn_with_micro(direction, duration_s, pi, debug):
 
 
 def run_forward_with_camera(duration_s, pi, debug):
+    global resume_boost_until
     front_filtered = left_filtered = right_filtered = None
     integral = 0.0
     previous_error = 0.0
@@ -1362,6 +1382,19 @@ def run_forward_with_camera(duration_s, pi, debug):
         now = time.perf_counter()
         dt = max(now - loop_started_at, 0.001)
         loop_started_at = now
+        if now < resume_boost_until:
+            integral = 0.0
+            previous_error = 0.0
+            left_duty = clamp(RESUME_STRAIGHT_PWM + LEFT_MOTOR_TRIM_PWM, MIN_DRIVE_PWM_DUTY, MAX_DRIVE_PWM_DUTY)
+            right_duty = clamp(RESUME_STRAIGHT_PWM + RIGHT_MOTOR_TRIM_PWM, MIN_DRIVE_PWM_DUTY, MAX_DRIVE_PWM_DUTY)
+            apply_drive(pi, left_duty, right_duty)
+            if debug and (now - last_debug_at) >= PID_DEBUG_PRINT_INTERVAL_S:
+                print(f"[resume-smooth] front={format_distance(front_filtered)} left={format_distance(left_filtered)} right={format_distance(right_filtered)} pwm=({left_duty:.0f},{right_duty:.0f})")
+                last_debug_at = now
+            sleep_for = PID_LOOP_DT_S - (time.perf_counter() - now)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            continue
         if mode == "trim-only":
             integral = previous_error = 0.0
         elif error == 0.0 or (previous_error != 0.0 and (error > 0.0) != (previous_error > 0.0)):
@@ -1376,15 +1409,16 @@ def run_forward_with_camera(duration_s, pi, debug):
             ultra_adjust = clamp(ultra_adjust * right_boost, -PID_MAX_LEFT_ADJUST, PID_MAX_RIGHT_ADJUST)
         if min_adjust > 0.0 and error != 0.0 and abs(ultra_adjust) < min_adjust:
             ultra_adjust = min_adjust if ultra_adjust >= 0.0 else -min_adjust
-        camera_adjust, camera_mode = get_line_correction()
-        combined_adjust = clamp(ultra_adjust + camera_adjust, -PID_MAX_LEFT_ADJUST, PID_MAX_RIGHT_ADJUST)
+        camera_adjust = 0.0
+        camera_mode = "camera-disabled"
+        combined_adjust = ultra_adjust
         base_duty = choose_forward_base_duty(front_filtered, left_filtered, right_filtered)
         left_duty = clamp(base_duty + LEFT_MOTOR_TRIM_PWM + combined_adjust, MIN_DRIVE_PWM_DUTY, MAX_DRIVE_PWM_DUTY)
         right_duty = clamp(base_duty + RIGHT_MOTOR_TRIM_PWM - combined_adjust, MIN_DRIVE_PWM_DUTY, MAX_DRIVE_PWM_DUTY)
         apply_drive(pi, left_duty, right_duty)
         previous_error = error
         if debug and (now - last_debug_at) >= PID_DEBUG_PRINT_INTERVAL_S:
-            print(f"[pid-camera] mode={mode}{'+coarse' if coarse_recovery else ''} {camera_mode} front={format_distance(front_filtered)} left={format_distance(left_filtered)} right={format_distance(right_filtered)} err={error:.2f} delta={side_delta:.2f} ultra={ultra_adjust:.1f} cam={camera_adjust:.1f} adj={combined_adjust:.1f} pwm=({left_duty:.0f},{right_duty:.0f})")
+            print(f"[pid-ultra] mode={mode}{'+coarse' if coarse_recovery else ''} {camera_mode} front={format_distance(front_filtered)} left={format_distance(left_filtered)} right={format_distance(right_filtered)} err={error:.2f} delta={side_delta:.2f} ultra={ultra_adjust:.1f} adj={combined_adjust:.1f} pwm=({left_duty:.0f},{right_duty:.0f})")
             last_debug_at = now
         sleep_for = PID_LOOP_DT_S - (time.perf_counter() - now)
         if sleep_for > 0:
@@ -1400,7 +1434,7 @@ def execute_step(direction, duration_s, pi, debug):
     if not wait_until_run_enabled(pi):
         return "paused"
     if direction in ("forward", "straight"):
-        print(f"{direction} with line assist + side PID" + (" until front stop" if duration_s is None else f" for {duration_s:.1f}s"))
+        print(f"{direction} with ultrasonic side PID" + (" until front stop" if duration_s is None else f" for {duration_s:.1f}s"))
         return run_forward_with_camera(duration_s, pi, debug=debug)
     if duration_s is None:
         raise ValueError(f"Timed direction requires a duration: {direction}")
